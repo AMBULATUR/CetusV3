@@ -1,0 +1,27 @@
+{
+  "name": "cetus",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Dynamic analysis Chrome extension for WebAssembly",
+  "license": "GPL-3.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "e2e": "node tests/e2e/run.mjs && node tests/e2e/ui.mjs && node tests/e2e/iframe.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/node": "^25.8.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8",
+    "wabt": "^1.0.39",
+    "esbuild": "^0.25.0"
+  }
+}

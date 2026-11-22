@@ -1,0 +1,12 @@
+.spectra/
+openspec/.vector-search.db*
+
+# Node + build artifacts
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Rust build artifacts (Stage 5 onward)
+target/
+crates/*/pkg/
