@@ -108,3 +108,29 @@ The search breadth and the number of kept paths are adjustable for large heaps.
 ## Layout
 `src/wasm` binary parser, opcode table, rewriter, assembler/disassembler · `src/page` main-world runtime (hooks, scan, strings, RPC) ·
 `src/content` bridge · `src/background` opens the workspace · `src/app` UI · `legacy/` the old 1.x sources, kept for reference.
+
+
+### Development
+
+- **CXPhoenix** — Previous Cetus fork and upstream modifications.
+- **Jack Baker (Qwokka)** — Original Cetus project and development.
+- **Tigran Tumasov** — Original Cetus UI/UX and frontend design.
+- **Bradlee Keith Setliff** — Original WAIL and Cetus logo designs.
+- **AMBULATUR** — Manifest V3 implementation, new UI/UX design, improvements and maintenance.
+
+### Original Projects
+
+- [AMBULATUR/CetusV3](https://github.com/AMBULATUR/CetusV3) — Current project.
+- [CXPhoenix/Cetus](https://github.com/CXPhoenix/Cetus) — Previous upstream fork.
+- [Qwokka/Cetus](https://github.com/Qwokka/Cetus) — Original project.
+- [WAIL](https://github.com/Qwokka/wail) — WebAssembly instrumentation.
+
+### License
+
+CetusV3 is distributed under the **Apache License 2.0**, retaining the original project's licensing terms and applicable attribution requirements.
+
+See the [LICENSE](LICENSE) file for the full license text.
+
+Third-party libraries and components remain subject to their respective licenses and copyright notices. Their original attribution and license terms must be preserved where applicable.
+
+All rights reserved to their respective authors and contributors.
