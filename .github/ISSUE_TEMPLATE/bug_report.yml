@@ -1,0 +1,92 @@
+
+name: Bug report
+description: Report a problem with Cetus 3
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug!
+        Please provide enough information to reproduce it.
+
+  - type: input
+    id: version
+    attributes:
+      label: Cetus version
+      description: Which version are you using?
+      placeholder: "3.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: browser
+    attributes:
+      label: Browser
+      options:
+        - Google Chrome
+        - Microsoft Edge
+        - Brave
+        - Other Chromium browser
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Affected component
+      options:
+        - Scanner
+        - Memory editor
+        - Cheat table
+        - Functions / Disassembler
+        - Debugger / Breakpoints
+        - WebAssembly rewriting
+        - Scripts / Hotkeys
+        - Extension installation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a WebAssembly application.
+        2. Open Cetus workspace.
+        3. Open Scanner.
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console errors or logs
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Attach screenshots if relevant.
+    validations:
+      required: false
