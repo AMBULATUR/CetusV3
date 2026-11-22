@@ -10,3 +10,7 @@ dist/
 # Rust build artifacts (Stage 5 onward)
 target/
 crates/*/pkg/
+
+# Todo
+docs/
+openspec/
