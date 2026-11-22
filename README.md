@@ -2,7 +2,7 @@
 
 A rewrite of the Cetus fork around a **full-tab workspace** (no more popup that closes when you click the wasm app),
 a **new WebAssembly rewriter** that handles modern wasm, and a Cheat-Engine / Ghidra-style toolset.
-
+![Cetus preview](cetus.png)
 ## Build & load
 
 ```bash
