@@ -1,4 +1,5 @@
 import { ModuleRec, PageConfig } from "./module-rec";
+import { WatchMem } from "./watchmem";
 import { ScanSession, ScanParams, parsePattern, findPattern } from "./scan";
 import { StringStore, StringScanParams, StringQuery } from "./strings";
 import { ValType, TYPE_INFO, isValType, readVal, writeVal, parseVal, enc, Val, fmtVal } from "../shared/codec";
@@ -53,6 +54,9 @@ export class CetusInstance {
   private memRate = new Map<number, { t: number; n: number }>();
   private exportsBy: Map<number, string[]> | null = null;
   ptrScan: PointerScan | null = null;
+  /** watch table in linear memory (threaded modules): shared with every Web Worker running this module */
+  wm: WatchMem | null = null;
+  private ringTimer: ReturnType<typeof setInterval> | null = null;
   scripts = new ScriptManager();
   imports: { hit: (k: number, s: number) => void; fhit: (s: number, i: number) => void; bp: (id: number, ea: number, bits: bigint) => void; bpl: (id: number, idx: number, bits: bigint) => void };
   // ---- line breakpoints
@@ -93,6 +97,11 @@ export class CetusInstance {
       }
     }
     this.memory = mem instanceof WebAssembly.Memory ? mem : null;
+    const sh = this.rec.rr?.shared;
+    if (sh && this.memory) {
+      this.wm = new WatchMem(this.memory, sh.ctrl);
+      this.wm.init();
+    }
     const nf = (m?.funcTypeIdx.length ?? 0);
     this.traceCounts = new Uint32Array(nf);
     const feat = this.rec.rr?.features;
@@ -338,8 +347,32 @@ export class CetusInstance {
     const f = this.features;
     const w = this.slots.some((s) => s && (s.flags & 6));
     const r = this.slots.some((s) => s && (s.flags & 1));
-    if (f.write) this.g("__c_wen").value = w ? 1 : 0;
-    if (f.read) this.g("__c_ren").value = r ? 1 : 0;
+    if (this.wm) this.wm.setEnables(f.write && w, f.read && r);
+    else {
+      if (f.write) this.g("__c_wen").value = w ? 1 : 0;
+      if (f.read) this.g("__c_ren").value = r ? 1 : 0;
+    }
+    if (this.wm) this.syncRingPoll();
+  }
+
+  /** Hits from Web Workers cannot call into this realm: they land in the ring buffer, which we poll while anything is armed. */
+  private syncRingPoll(): void {
+    const armed = this.slots.some(Boolean);
+    if (armed && !this.ringTimer) this.ringTimer = setInterval(() => this.pollRing(), 100);
+    else if (!armed && this.ringTimer) { this.pollRing(); clearInterval(this.ringTimer); this.ringTimer = null; }
+  }
+  ringLost = 0;
+  pollRing(): void {
+    const wm = this.wm;
+    if (!wm) return;
+    let hits;
+    try { hits = wm.drain(); } catch { return; } // memory detached / grown: try again next tick
+    this.ringLost = wm.lost;
+    for (const h of hits) {
+      const s = this.slots[h.slot];
+      const frame: Frame = { fn: h.func, off: 0, origOff: h.off, name: this.funcName(h.func) };
+      this.record(h.kind === 1 ? "read" : "write", h.slot, s?.addr ?? h.ea, [frame]);
+    }
   }
   op_watch_set(a: { addr: number; size: number; flags: number; value?: string }) {
     const f = this.features;
@@ -358,11 +391,14 @@ export class CetusInstance {
     let cur: bigint;
     if (a.value !== undefined && a.value !== "") cur = BigInt.asUintN(size * 8, BigInt(a.value));
     else cur = size === 8 ? dv.getBigUint64(a.addr, true) : BigInt(size === 4 ? dv.getUint32(a.addr, true) : size === 2 ? dv.getUint16(a.addr, true) : dv.getUint8(a.addr));
-    this.g(`__c_wf${slot}`).value = 0;
-    this.g(`__c_wa${slot}`).value = a.addr | 0;
-    this.g(`__c_ws${slot}`).value = size;
-    this.g(`__c_wv${slot}`).value = BigInt.asIntN(64, cur);
-    this.g(`__c_wf${slot}`).value = flags;
+    if (this.wm) this.wm.arm(slot, a.addr, size, flags, cur);
+    else {
+      this.g(`__c_wf${slot}`).value = 0;
+      this.g(`__c_wa${slot}`).value = a.addr | 0;
+      this.g(`__c_ws${slot}`).value = size;
+      this.g(`__c_wv${slot}`).value = BigInt.asIntN(64, cur);
+      this.g(`__c_wf${slot}`).value = flags;
+    }
     this.slots[slot] = { addr: a.addr, size, flags, hard: true };
     this.recomputeEnables();
     return { slot, flags };
@@ -372,7 +408,8 @@ export class CetusInstance {
       const s = this.slots[i];
       if (!s) continue;
       if (a.slot === i || (a.addr === s.addr && (a.size === undefined || a.size === s.size))) {
-        this.g(`__c_wf${i}`).value = 0;
+        if (this.wm) this.wm.disarm(i);
+        else this.g(`__c_wf${i}`).value = 0;
         this.slots[i] = null;
       }
     }
@@ -454,7 +491,7 @@ export class CetusInstance {
     const dv = new DataView(buf);
     return a.items.map((it) => {
       let addr = it.addr ?? -1;
-      if (it.ptr) { const r = resolveChain(buf, it.ptr); addr = r ?? -1; }
+      if (it.ptr) { const r = resolveChain(buf, it.ptr, this.gv); addr = r ?? -1; }
       if (it.type === "str8" || it.type === "str16") {
         if (addr < 0 || addr >= dv.byteLength) return { a: addr, v: null };
         return { a: addr, v: readCString(buf, addr, it.type === "str16" ? "utf16" : "utf8", Math.min(it.len ?? 128, 1024)) };
@@ -525,10 +562,58 @@ export class CetusInstance {
     const hi = Math.min(memLen, detected ? (end + 15) & ~15 : 0x400000);
     return { lo: 0x100, hi, end, detected, source: detected ? source : "could not be detected (defaulting to the first 4 MiB — adjust it)", memLen, heapBase };
   }
-  op_ptr_start(a: PtrParams) {
+  private gv = (i: number): number | null => this.globalValue(i);
+  /** current value of Wasm global `idx` (i32 only): our `__c_g<idx>` export, or the module's own export of it */
+  globalValue(idx: number): number | null {
+    const g = this.globalObj(idx);
+    if (!g) return null;
+    try { const v = g.value; return typeof v === "number" ? v >>> 0 : null; } catch { return null; }
+  }
+  private globalExportNames: Map<number, string> | null = null;
+  private globalObj(idx: number): WebAssembly.Global | null {
+    let x = this.exps[`__c_g${idx}`];
+    if (!x) {
+      if (!this.globalExportNames) {
+        this.globalExportNames = new Map();
+        for (const e of this.rec.model?.exports ?? []) if (e.kind === 3 && !this.globalExportNames.has(e.index)) this.globalExportNames.set(e.index, e.name);
+      }
+      const n = this.globalExportNames.get(idx);
+      if (n) x = this.exps[n];
+    }
+    return x && typeof x === "object" && "value" in x ? (x as WebAssembly.Global) : null;
+  }
+  /** i32 globals that currently hold something that looks like a heap/static pointer */
+  op_ptr_globals() {
+    const m = this.rec.model;
+    const memLen = this.memory ? this.buf().byteLength : 0;
+    // linker constants describe the layout, not objects
+    const skip = /^(__stack_pointer|__stack_base|__stack_end|__stack_low|__stack_high|__heap_base|__heap_end|__data_end|__global_base|__memory_base|__table_base|__tls_base|__tls_size|__tls_align)$/;
+    const names = new Map<number, string>();
+    for (const e of m?.exports ?? []) if (e.kind === 3 && !names.has(e.index)) names.set(e.index, e.name);
+    const out: { idx: number; value: number; name: string; mutable: boolean }[] = [];
+    (m?.globals ?? []).forEach((g, idx) => {
+      if (g.valType !== "i32") return;
+      const name = names.get(idx) ?? "";
+      if (skip.test(name)) return;
+      const v = this.globalValue(idx);
+      if (v === null || v < 0x1000 || v >= memLen || (v & 3) !== 0) return;
+      out.push({ idx, value: v, name, mutable: g.mutable });
+    });
+    return out;
+  }
+  op_ptr_start(a: PtrParams & { useGlobals?: boolean }) {
     this.ptrScan?.cancel();
+    // vtables live in static data: the span of the module's active data segments (or the user's static range)
+    let vtLo = a.vtLo, vtHi = a.vtHi;
+    if (a.requireVtable && (vtLo === undefined || vtHi === undefined)) {
+      const L = this.rec.model ? findStaticLayout(this.rec.model) : null;
+      const rs = L?.ranges.filter((x) => x.hi > x.lo) ?? [];
+      if (rs.length) { vtLo ??= Math.min(...rs.map((x) => x.lo)); vtHi ??= Math.max(L!.end, ...rs.map((x) => x.hi)); }
+      else { vtLo ??= a.staticLo; vtHi ??= a.staticHi; }
+    }
     const sc = new PointerScan(() => this.buf(), {
-      ...a, maxOff: Math.max(0, a.maxOff | 0), levels: Math.max(1, Math.min(6, a.levels | 0)),
+      ...a, vtLo, vtHi, globals: a.useGlobals ? this.op_ptr_globals().map((g) => ({ idx: g.idx, value: g.value })) : [],
+      maxPairs: Math.max(1_000_000, Math.min(200_000_000, a.maxPairs ?? 64_000_000)), maxOff: Math.max(0, a.maxOff | 0), levels: Math.max(1, Math.min(6, a.levels | 0)),
       maxFrontier: Math.max(1000, Math.min(2_000_000, a.maxFrontier ?? 20000)), maxResults: Math.max(100, Math.min(100_000, a.maxResults ?? 5000)),
     });
     this.ptrScan = sc;
@@ -538,7 +623,7 @@ export class CetusInstance {
   op_ptr_status() {
     const s = this.ptrScan;
     if (!s) return { running: false, progress: 0, level: 0, results: 0, frontier: 0, capped: false, error: null, started: false };
-    return { running: s.running, progress: s.progress, level: s.level, results: s.results.length, frontier: s.frontier, capped: s.capped, error: s.error, started: true };
+    return { running: s.running, progress: s.progress, level: s.level, results: s.results.length, frontier: s.frontier, capped: s.capped, error: s.error, started: true, indexed: s.indexed, vtableRejected: s.vtableRejected };
   }
   op_ptr_results(a: { offset: number; limit: number; type?: ValType }) {
     const s = this.ptrScan;
@@ -546,7 +631,7 @@ export class CetusInstance {
     const buf = this.buf();
     const dv = new DataView(buf);
     const rows = s.results.slice(a.offset | 0, (a.offset | 0) + clampLimit(a.limit)).map((c) => {
-      const now = resolveChain(buf, c);
+      const now = resolveChain(buf, c, this.gv);
       const v = a.type && isValType(a.type) && now !== null && now + TYPE_INFO[a.type].size <= dv.byteLength ? enc(readVal(dv, now, a.type)) : null;
       return { ...c, now, v };
     });
@@ -557,7 +642,7 @@ export class CetusInstance {
     const buf = this.buf();
     const dv = new DataView(buf);
     return a.chains.map((c) => {
-      const now = resolveChain(buf, c);
+      const now = resolveChain(buf, c, this.gv);
       const v = a.type && isValType(a.type) && now !== null && now + TYPE_INFO[a.type].size <= dv.byteLength ? enc(readVal(dv, now, a.type)) : null;
       return { now, v };
     });
@@ -565,7 +650,7 @@ export class CetusInstance {
   op_ptr_cancel() { this.ptrScan?.cancel(); return true; }
   op_ptr_resolve(a: { chains: Chain[] }) {
     const buf = this.buf();
-    return a.chains.map((c) => resolveChain(buf, c));
+    return a.chains.map((c) => resolveChain(buf, c, this.gv));
   }
 
   // ---- text rows ------------------------------------------------------------------

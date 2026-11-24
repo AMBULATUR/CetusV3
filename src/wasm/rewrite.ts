@@ -50,10 +50,51 @@ export interface BpFound {
   localCodes: number[];
 }
 
+/**
+ * Shared-memory watchpoint state ("control block").
+ *
+ * Globals are per *instance*, so a watchpoint armed through the main thread's globals is invisible to
+ * Emscripten pthread workers (each worker instantiates its own copy of the module). When the module's
+ * memory is shared we therefore keep the watch table inside linear memory instead; every thread reads
+ * the same bytes. All fields are 32-bit little-endian words unless noted.
+ *
+ *   +0x00 magic            +0x04 wen (write hooks on)   +0x08 ren (read hooks on)
+ *   +0x0c ring head (atomic, claimed by hitting threads)
+ *   +0x20 slot[0..7], 32 bytes each: addr, size, flags, -, val(i64 @ +16)
+ *   +0x120 hit ring: 16 entries x 32 bytes: kind|slot<<8, ea, func, off, commit(seq+1)
+ */
+export const CTRL = {
+  MAGIC: 0x43455455,
+  WEN: 0x04,
+  REN: 0x08,
+  HEAD: 0x0c,
+  SLOTS: 0x20,
+  SLOT_STRIDE: 32,
+  MAX_SLOTS: 8,
+  RING: 0x20 + 8 * 32,
+  RING_N: 16,
+  RING_STRIDE: 32,
+  SIZE: 0x20 + 8 * 32 + 16 * 32,
+  DEFAULT_ADDR: 0x20,
+} as const;
+
+export interface SharedWatchOptions {
+  /** address of the control block in linear memory (8-byte aligned) */
+  ctrl: number;
+  /**
+   * Worker-safe build: adds NO imports. Hits are appended to the ring buffer inside the control block
+   * (with function + instruction offset) instead of calling `__cetus.hit`, and function hooks / line
+   * breakpoints are left out. This is the build handed to Web Workers.
+   */
+  ring?: boolean;
+}
+
 export interface RewriteOptions {
   instrument?: InstrumentConfig | null;
   patches?: FunctionPatch[];
   bps?: BpRequest[];
+  /** keep the watch table in shared linear memory (only honoured when memory 0 is `shared`) */
+  shared?: SharedWatchOptions | null;
 }
 
 export interface GlobalNames {
@@ -72,6 +113,8 @@ export interface RewriteResult {
   /** true if any instrumentation was inserted */
   instrumented: boolean;
   features: { write: boolean; read: boolean; funcHooks: boolean; slots: number; funcSlots: number };
+  /** set when the watch table lives in linear memory (see CTRL); null = per-instance globals */
+  shared: { ctrl: number; ring: boolean } | null;
   /** number of function imports added (all function indices >= N0 shift by K) */
   K: number;
   N0: number;
@@ -95,7 +138,7 @@ export const IMPORT_MODULE = "__cetus";
 // ---------------------------------------------------------------------------
 // Helper function generation (assembled from text so it can be read & tested)
 // ---------------------------------------------------------------------------
-const T = { hit: 0, void: 1, wslot: 2, rcheck: 3, fcheck: 4, bp: 5 };
+const T = { hit: 0, void: 1, wslot: 2, rcheck: 3, fcheck: 4, bp: 5, rcheckF: 6, record: 7, wslotF: 8 };
 
 function bodyOf(text: string): Uint8Array {
   const a = assemble(text);
@@ -105,7 +148,15 @@ function bodyOf(text: string): Uint8Array {
   return w.result();
 }
 
-function genWslot(hitIdx: number): Uint8Array {
+/**
+ * `ring` = worker-safe flavour: two more params (func, off) and the hit goes to `hitIdx`, which then is the
+ * local ring-buffer recorder (kind, slot, ea, func, off) instead of the imported `__cetus.hit(kind, slot)`.
+ */
+function genWslot(hitIdx: number, ring = false): Uint8Array {
+  const L = ring ? 7 : 5; // index of the scratch i64 local (after the params)
+  const hitCall = ring
+    ? `i32.const 2\n    local.get 4\n    local.get 0\n    local.get 5\n    local.get 6\n    call ${hitIdx}`
+    : `i32.const 2\n    local.get 4\n    call ${hitIdx}`;
   return bodyOf(`
 .locals i64
 local.get 1
@@ -134,7 +185,7 @@ else
     end
   end
 end
-local.tee 5
+local.tee ${L}
 local.get 3
 i64.ne
 if
@@ -142,9 +193,7 @@ if
   i32.const 2
   i32.and
   if
-    i32.const 2
-    local.get 4
-    call ${hitIdx}
+    ${hitCall}
   end
   local.get 2
   i32.const 4
@@ -181,10 +230,129 @@ if
       end
     end
     local.get 3
-    local.set 5
+    local.set ${L}
   end
 end
+local.get ${L}
+end`);
+}
+
+const slotAt = (ctrl: number, s: number): number => ctrl + CTRL.SLOTS + s * CTRL.SLOT_STRIDE;
+
+/** wcheck for the shared-memory watch table. Ring flavour takes (func, off) so a hit can name its code. */
+function genWcheckMem(ctrl: number, wslotIdx: number, slots: number, ring: boolean): Uint8Array {
+  const tmp = ring ? 2 : 0;
+  let t = `\n.locals i64`;
+  for (let s = 0; s < slots; s++) {
+    const a = slotAt(ctrl, s);
+    t += `
+i32.const ${a + 8}
+i32.load
+i32.const 6
+i32.and
+if
+  i32.const ${a}
+  i32.load
+  i32.const ${a + 4}
+  i32.load
+  i32.const ${a + 8}
+  i32.load
+  i32.const ${a + 16}
+  i64.load
+  i32.const ${s}${ring ? "\n  local.get 0\n  local.get 1" : ""}
+  call ${wslotIdx}
+  local.set ${tmp}
+  i32.const ${a + 16}
+  local.get ${tmp}
+  i64.store
+end`;
+  }
+  return bodyOf(t + "\nend");
+}
+
+/** rcheck for the shared-memory watch table. Ring flavour: (ea, offset, size, func, off). */
+function genRcheckMem(ctrl: number, hitIdx: number, slots: number, ring: boolean): Uint8Array {
+  const tmp = ring ? 5 : 3;
+  let t = `
+.locals i32
+local.get 0
+local.get 1
+i32.add
+local.set ${tmp}`;
+  for (let s = 0; s < slots; s++) {
+    const a = slotAt(ctrl, s);
+    t += `
+i32.const ${a + 8}
+i32.load
+i32.const 1
+i32.and
+if
+  local.get ${tmp}
+  i32.const ${a}
+  i32.load
+  i32.const ${a + 4}
+  i32.load
+  i32.add
+  i32.lt_u
+  if
+    local.get ${tmp}
+    local.get 2
+    i32.add
+    i32.const ${a}
+    i32.load
+    i32.gt_u
+    if
+      i32.const 1
+      i32.const ${s}${ring ? `\n      local.get ${tmp}\n      local.get 3\n      local.get 4` : ""}
+      call ${hitIdx}
+    end
+  end
+end`;
+  }
+  return bodyOf(t + "\nend");
+}
+
+/**
+ * record(kind, slot, ea, func, off): lock-free append to the hit ring. Safe to call from any thread:
+ * the slot is claimed with an atomic add, the payload is written, and the commit word (seq+1) is stored
+ * last with an atomic store so the reader can tell a finished entry from one still being written.
+ */
+function genRecord(ctrl: number): Uint8Array {
+  const ring = ctrl + CTRL.RING;
+  return bodyOf(`
+.locals i32 i32
+i32.const ${ctrl + CTRL.HEAD}
+i32.const 1
+i32.atomic.rmw.add
+local.tee 5
+i32.const ${CTRL.RING_N - 1}
+i32.and
+i32.const 5
+i32.shl
+i32.const ${ring}
+i32.add
+local.set 6
+local.get 6
+local.get 0
+local.get 1
+i32.const 8
+i32.shl
+i32.or
+i32.store
+local.get 6
+local.get 2
+i32.store offset=4
+local.get 6
+local.get 3
+i32.store offset=8
+local.get 6
+local.get 4
+i32.store offset=12
+local.get 6
 local.get 5
+i32.const 1
+i32.add
+i32.atomic.store offset=16
 end`);
 }
 
@@ -395,6 +563,26 @@ interface BodyCtx {
   found: (BpFound | null)[];
   bpImport: number;
   bplImport: number;
+  /** watch table in shared linear memory (null = per-instance globals) */
+  shared: { ctrl: number; ring: boolean } | null;
+}
+
+/**
+ * Which operands sit above the address on the stack for an instruction that READS linear memory through
+ * memarg 0, as value-type codes bottom -> top. null = not a (hookable) read.
+ *   plain / atomic / SIMD loads        -> []            (address is on top)
+ *   v128.loadN_lane                    -> [v128]
+ *   atomic rmw (read-modify-write)     -> [t]
+ *   atomic rmw cmpxchg                 -> [t, t]
+ */
+function readOperands(name: string, imm: string, acc: { load: boolean; store: boolean } | undefined): number[] | null {
+  if (!acc || !acc.load) return null;
+  if (imm === "memarglane") return acc.store ? null : [0x7b];
+  if (imm !== "memarg") return null;
+  if (!acc.store) return [];
+  if (!/\.atomic\.rmw/.test(name)) return null;
+  const t = name.startsWith("i64.") ? 0x7e : 0x7f;
+  return /cmpxchg/.test(name) ? [t, t] : [t];
 }
 
 const shiftFn = (ctx: { N0: number; K: number }) => (i: number) => (i >= ctx.N0 ? i + ctx.K : i);
@@ -524,15 +712,21 @@ export function rewriteBody(
       sitePost?.();
       continue;
     }
-    if (ctx.read && baseLocal >= 0 && acc && acc.load && !acc.store && op.imm === "memarg" && ins.memIdx === 0) {
+    const spill = ctx.read && baseLocal >= 0 && ins.memIdx === 0 ? readOperands(op.name, op.imm, acc) : null;
+    if (spill && acc) {
       const sc = scratch("rd", 0x7f);
-      cw.u8(0x22).u32(sc); // local.tee scratch
-      cw.u8(0x23).u32(ctx.renIdx).u8(0x04).u8(0x40); // global.get ren; if
+      const sp = spill.map((t, i) => scratch(`sp${i}_${t}`, t));
+      for (let i = sp.length - 1; i >= 0; i--) cw.u8(0x21).u32(sp[i]!); // park the operands above the address
+      cw.u8(0x22).u32(sc); // local.tee scratch (address stays on the stack for the load)
+      if (ctx.shared) cw.u8(0x41).s32(ctx.shared.ctrl + CTRL.REN).u8(0x28).u32(2).u32(0).u8(0x04).u8(0x40); // ren from memory; if
+      else cw.u8(0x23).u32(ctx.renIdx).u8(0x04).u8(0x40); // global.get ren; if
       cw.u8(0x20).u32(sc); // local.get scratch
       cw.u8(0x41).s32(ins.offset | 0); // i32.const offset
       cw.u8(0x41).s32(acc.size); // i32.const size
+      if (ctx.shared?.ring) cw.u8(0x41).s32(funcIdx).u8(0x41).s32(ins.pos - start); // where we are
       cw.u8(0x10).u32(ctx.rcheckIdx); // call rcheck
       cw.u8(0x0b);
+      for (let i = 0; i < sp.length; i++) cw.u8(0x20).u32(sp[i]!); // put the operands back
     }
     cw.raw(src.subarray(ins.pos, ins.end));
     if (ctx.write) {
@@ -543,7 +737,9 @@ export function rewriteBody(
         isWrite = memIdx === 0;
       }
       if (isWrite) {
-        cw.u8(0x23).u32(ctx.wenIdx).u8(0x04).u8(0x40); // global.get wen; if
+        if (ctx.shared) cw.u8(0x41).s32(ctx.shared.ctrl + CTRL.WEN).u8(0x28).u32(2).u32(0).u8(0x04).u8(0x40); // wen from memory; if
+        else cw.u8(0x23).u32(ctx.wenIdx).u8(0x04).u8(0x40); // global.get wen; if
+        if (ctx.shared?.ring) cw.u8(0x41).s32(funcIdx).u8(0x41).s32(ins.pos - start);
         cw.u8(0x10).u32(ctx.wcheckIdx); // call wcheck
         cw.u8(0x0b);
       }
@@ -576,6 +772,9 @@ function typeBytes(): Uint8Array[] {
     Uint8Array.of(0x60, 3, 0x7f, 0x7f, 0x7f, 0), // rcheck
     Uint8Array.of(0x60, 1, 0x7f, 0), // fcheck
     Uint8Array.of(0x60, 3, 0x7f, 0x7f, 0x7e, 0), // bp / bpl: (id, ea|index, value bits) -> ()
+    Uint8Array.of(0x60, 5, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0), // rcheckF: (ea, offset, size, func, off) -> ()
+    Uint8Array.of(0x60, 5, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0), // record: (kind, slot, ea, func, off) -> ()
+    Uint8Array.of(0x60, 7, 0x7f, 0x7f, 0x7f, 0x7e, 0x7f, 0x7f, 0x7f, 1, 0x7e), // wslotF
   ];
 }
 
@@ -590,6 +789,23 @@ function nameSet(slots: number, funcSlots: number): GlobalNames {
   for (let i = 0; i < funcSlots; i++) g.fbp.push(`__c_fb${i}`);
   return g;
 }
+
+/** Why a control block cannot live at `ctrl` in this module (null = it can). */
+export function sharedUnsupported(m: ModuleModel, ctrl: number): string | null {
+  const mem = m.memories[0];
+  if (!mem) return "module has no memory";
+  if (!mem.limits.shared) return "memory is not shared";
+  if (mem.limits.memory64) return "memory64";
+  if (!Number.isInteger(ctrl) || ctrl < 8 || (ctrl & 7) !== 0) return "control block address must be 8-byte aligned";
+  if (ctrl + CTRL.SIZE > mem.limits.min * 65536) return "memory is too small for the control block";
+  for (const d of m.data) {
+    if (d.mode !== "active" || d.memIdx !== 0) continue;
+    if (d.offset === null) return "a data segment has a non-constant offset, cannot prove the control block is free";
+    if (d.offset < ctrl + CTRL.SIZE && d.offset + d.size > ctrl) return `a data segment overlaps ${hex(ctrl)}..${hex(ctrl + CTRL.SIZE)}`;
+  }
+  return null;
+}
+const hex = (n: number): string => "0x" + n.toString(16);
 
 export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): RewriteResult {
   const warnings: string[] = [];
@@ -610,12 +826,25 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
     doWrite = false;
     doRead = false;
   }
-  const slots = doWrite || doRead ? Math.min(16, cfg!.slots) : 0;
+  // ---- watch table in shared linear memory? (threaded builds) ----------------------------------------
+  let shared: { ctrl: number; ring: boolean } | null = null;
+  if (opts.shared && (doWrite || doRead)) {
+    const why = sharedUnsupported(m, opts.shared.ctrl);
+    if (why) warnings.push(`shared-memory watchpoints disabled: ${why}`);
+    else shared = { ctrl: opts.shared.ctrl, ring: !!opts.shared.ring };
+  }
+  if (shared?.ring) {
+    // worker-safe build: must not import anything, so no function hooks / line breakpoints
+    doFunc = false;
+  }
+  const ring = !!shared?.ring;
+  const slots = doWrite || doRead ? Math.min(shared ? CTRL.MAX_SLOTS : 16, cfg!.slots) : 0;
   const funcSlots = doFunc ? Math.min(16, cfg!.funcSlots) : 0;
   // line breakpoints on patched functions would refer to patched code: only original bodies are supported
-  const bpReq = (opts.bps ?? []).filter((b) => b.func >= m.numImportedFuncs && b.func - m.numImportedFuncs < m.bodies.length && !patches.has(b.func));
+  const bpReq = ring ? [] : (opts.bps ?? []).filter((b) => b.func >= m.numImportedFuncs && b.func - m.numImportedFuncs < m.bodies.length && !patches.has(b.func));
   const hasBps = bpReq.length > 0;
-  const K = doWrite || doRead || doFunc || hasBps ? (hasBps ? 4 : 2) : 0;
+  const active = doWrite || doRead || doFunc || hasBps;
+  const K = active && !ring ? (hasBps ? 4 : 2) : 0;
   const N0 = m.numImportedFuncs;
   const shift = shiftFn({ N0, K });
 
@@ -624,11 +853,11 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   const needMemExport = m.memories.length > 0 && !m.memories[0]!.imported && !memExported;
   if (m.warnings.length) warnings.push(...m.warnings);
 
-  const nothingToDo = K === 0 && patches.size === 0 && !needMemExport;
+  const nothingToDo = !active && patches.size === 0 && !needMemExport;
   const emptyNames: GlobalNames = nameSet(0, 0);
   if (nothingToDo) {
     return {
-      bytes, instrumented: false, features: { write: false, read: false, funcHooks: false, slots: 0, funcSlots: 0 },
+      bytes, instrumented: false, features: { write: false, read: false, funcHooks: false, slots: 0, funcSlots: 0 }, shared: null,
       K: 0, N0, helperStart: Infinity, newBodyStart: new Uint32Array(0), memoryExport: null, globals: emptyNames,
       patched: [], warnings, ctxIdx: { wen: 0, ren: 0, fen: 0, wcheck: 0, rcheck: 0, fcheck: 0 },
       bp: { found: [], sitesByFunc: new Map(), flagNames: [], reqs: [] },
@@ -651,11 +880,11 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   const globalExports: { name: string; idx: number }[] = [];
   const exportGlobal = (name: string, idx: number) => globalExports.push({ name, idx });
 
-  if (doWrite) {
+  if (doWrite && !shared) {
     gidx.wen = addGlobal(0x7f, 0);
     exportGlobal("__c_wen", gidx.wen);
   }
-  if (doRead) {
+  if (doRead && !shared) {
     gidx.ren = addGlobal(0x7f, 0);
     exportGlobal("__c_ren", gidx.ren);
   }
@@ -663,7 +892,7 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
     gidx.fen = addGlobal(0x7f, 0);
     exportGlobal("__c_fen", gidx.fen);
   }
-  for (let s = 0; s < slots; s++) {
+  for (let s = 0; s < (shared ? 0 : slots); s++) {
     gidx.addr.push(addGlobal(0x7f, 0));
     gidx.size.push(addGlobal(0x7f, 0));
     gidx.flags.push(addGlobal(0x7f, 0));
@@ -676,6 +905,15 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   for (let f = 0; f < funcSlots; f++) {
     gidx.fbp.push(addGlobal(0x7f, -1));
     exportGlobal(gnames.fbp[f]!, gidx.fbp[f]!);
+  }
+  // expose every i32 global (mutable or not) so the pointer scanner can use global singletons as chain roots
+  const exportedGlobalIdx = new Set(m.exports.filter((e) => e.kind === 3).map((e) => e.index));
+  let nGlobalRoots = 0;
+  for (let gi = 0; gi < m.globals.length && nGlobalRoots < 4096; gi++) {
+    const g = m.globals[gi]!;
+    if (g.valType !== "i32" || exportedGlobalIdx.has(gi)) continue;
+    exportGlobal(`__c_g${gi}`, gi);
+    nGlobalRoots++;
   }
   // one exported on/off flag per line breakpoint
   const sitesByFunc = new Map<number, Map<number, { id: number; flagIdx: number }>>();
@@ -691,10 +929,11 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   });
   const found: (BpFound | null)[] = bpReq.map(() => null);
   const gn: GlobalNames = { ...gnames };
-  if (doWrite) gn.wen = "__c_wen";
+  if (doWrite && !shared) gn.wen = "__c_wen";
   else delete gn.wen;
-  if (doRead) gn.ren = "__c_ren";
+  if (doRead && !shared) gn.ren = "__c_ren";
   else delete gn.ren;
+  if (shared) { gn.addr = []; gn.size = []; gn.flags = []; gn.val = []; }
   if (doFunc) gn.fen = "__c_fen";
   else delete gn.fen;
 
@@ -703,17 +942,25 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   const helperBase = N0 + K + origDefined;
   const helpers: { type: number; body: Uint8Array; name: string }[] = [];
   let wslotIdx = -1, wcheckIdx = -1, rcheckIdx = -1, fcheckIdx = -1;
-  const HIT = N0; // __cetus.hit
+  let HIT = N0; // __cetus.hit (import mode) or the local ring recorder (worker-safe mode)
   const FHIT = N0 + 1; // __cetus.fhit
+  if (ring && (doWrite || doRead)) {
+    HIT = helperBase + helpers.length;
+    helpers.push({ type: T0 + T.record, body: genRecord(shared!.ctrl), name: "__cetus_record" });
+  }
   if (doWrite) {
     wslotIdx = helperBase + helpers.length;
-    helpers.push({ type: T0 + T.wslot, body: genWslot(HIT), name: "__cetus_wslot" });
+    helpers.push({ type: T0 + (ring ? T.wslotF : T.wslot), body: genWslot(HIT, ring), name: "__cetus_wslot" });
     wcheckIdx = helperBase + helpers.length;
-    helpers.push({ type: T0 + T.void, body: genWcheck(gidx, wslotIdx, slots), name: "__cetus_wcheck" });
+    helpers.push(shared
+      ? { type: T0 + (ring ? T.hit : T.void), body: genWcheckMem(shared.ctrl, wslotIdx, slots, ring), name: "__cetus_wcheck" }
+      : { type: T0 + T.void, body: genWcheck(gidx, wslotIdx, slots), name: "__cetus_wcheck" });
   }
   if (doRead) {
     rcheckIdx = helperBase + helpers.length;
-    helpers.push({ type: T0 + T.rcheck, body: genRcheck(gidx, HIT, slots), name: "__cetus_rcheck" });
+    helpers.push(shared
+      ? { type: T0 + (ring ? T.rcheckF : T.rcheck), body: genRcheckMem(shared.ctrl, HIT, slots, ring), name: "__cetus_rcheck" }
+      : { type: T0 + T.rcheck, body: genRcheck(gidx, HIT, slots), name: "__cetus_rcheck" });
   }
   if (doFunc) {
     fcheckIdx = helperBase + helpers.length;
@@ -723,7 +970,7 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   const ctx: BodyCtx = {
     m, N0, K, write: doWrite, read: doRead, funcHooks: doFunc,
     wenIdx: gidx.wen, renIdx: gidx.ren, fenIdx: gidx.fen, wcheckIdx, rcheckIdx, fcheckIdx,
-    sites: sitesByFunc, found, bpImport: N0 + 2, bplImport: N0 + 3,
+    sites: sitesByFunc, found, bpImport: N0 + 2, bplImport: N0 + 3, shared,
   };
 
   // --- rewrite sections ----------------------------------------------------
@@ -741,7 +988,7 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
     return { count, restStart: r.pos };
   };
 
-  if (K > 0) {
+  if (active) {
     // types
     const typeSec = find(SEC.type);
     const tw = new Writer(256);
@@ -757,21 +1004,23 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
     // imports
     const impSec = find(SEC.import);
     const iw = new Writer(256);
-    const newImports = [
+    const newImports = K === 0 ? [] : [
       { field: "hit", type: T0 + T.hit },
       { field: "fhit", type: T0 + T.hit },
       ...(hasBps ? [{ field: "bp", type: T0 + T.bp }, { field: "bpl", type: T0 + T.bp }] : []),
     ];
-    if (impSec) {
-      const { count, restStart } = rest(impSec.sec!);
-      iw.u32(count + newImports.length);
-      iw.raw(bytes.subarray(restStart, impSec.sec!.end));
-    } else iw.u32(newImports.length);
-    for (const ni of newImports) {
-      iw.name(IMPORT_MODULE).name(ni.field).u8(0).u32(ni.type);
+    if (newImports.length) {
+      if (impSec) {
+        const { count, restStart } = rest(impSec.sec!);
+        iw.u32(count + newImports.length);
+        iw.raw(bytes.subarray(restStart, impSec.sec!.end));
+      } else iw.u32(newImports.length);
+      for (const ni of newImports) {
+        iw.name(IMPORT_MODULE).name(ni.field).u8(0).u32(ni.type);
+      }
+      if (impSec) impSec.payload = iw.result();
+      else insertNew(SEC.import, iw.result());
     }
-    if (impSec) impSec.payload = iw.result();
-    else insertNew(SEC.import, iw.result());
 
     // function section (helpers)
     if (helpers.length) {
@@ -847,7 +1096,7 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   // exports (shift function exports, append ours)
   const exSec = find(SEC.export);
   const memoryExport = needMemExport ? "__c_mem" : null;
-  if (K > 0 || memoryExport || globalExports.length) {
+  if (K > 0 || memoryExport || globalExports.length) { // (exports only need rewriting when indices shift or we add some)
     const ew = new Writer(256);
     const added = globalExports.length + (memoryExport ? 1 : 0);
     if (exSec) {
@@ -893,7 +1142,7 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
         patched.push(funcIdx);
       }
       let out: Uint8Array;
-      if (K > 0) out = rewriteBody(src, s, e, funcIdx, ctx);
+      if (active) out = rewriteBody(src, s, e, funcIdx, ctx);
       else out = src.subarray(s, e);
       cw.u32(out.length);
       relStarts[i] = cw.length;
@@ -929,8 +1178,9 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
 
   return {
     bytes: fw.result(),
-    instrumented: K > 0,
+    instrumented: active,
     features: { write: doWrite, read: doRead, funcHooks: doFunc, slots, funcSlots },
+    shared,
     K, N0,
     helperStart: helpers.length ? helperBase : Infinity,
     newBodyStart,
@@ -956,7 +1206,7 @@ export function mapFunctionOffsets(m: ModuleModel, funcIdx: number, rr: RewriteR
     m, N0: rr.N0, K: rr.K, write: f.write, read: f.read, funcHooks: f.funcHooks,
     wenIdx: rr.ctxIdx.wen, renIdx: rr.ctxIdx.ren, fenIdx: rr.ctxIdx.fen,
     wcheckIdx: rr.ctxIdx.wcheck, rcheckIdx: rr.ctxIdx.rcheck, fcheckIdx: rr.ctxIdx.fcheck,
-    sites: rr.bp.sitesByFunc, found: [], bpImport: rr.N0 + 2, bplImport: rr.N0 + 3,
+    sites: rr.bp.sitesByFunc, found: [], bpImport: rr.N0 + 2, bplImport: rr.N0 + 3, shared: rr.shared,
   };
   void cfg;
   const rec: number[] = [];

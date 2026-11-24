@@ -4,7 +4,7 @@ import { resolveChain } from "./pointer";
 import { readCString, writeCString } from "./cstring";
 import { ValType, TYPE_INFO, isValType, readVal, writeVal, parseVal } from "../shared/codec";
 
-export interface ScriptRowIn { label: string; type: string; addr?: number; ptr?: { base: number; offsets: number[] }; len?: number }
+export interface ScriptRowIn { label: string; type: string; addr?: number; ptr?: { base: number; offsets: number[]; global?: number }; len?: number }
 export interface RunRequest { id: string; name?: string; code: string; rows: ScriptRowIn[]; silent?: boolean }
 
 export function showToast(text: string, kind: "info" | "ok" | "error" = "info", ms = 2200): void {
@@ -43,7 +43,7 @@ export function createEnv(inst: CetusInstance, rows: Map<string, RowDef>, st: { 
   const isText = (t: string) => t === "str8" || t === "str16";
   const addrOf = (r: RowDef): number => {
     if (r.ptr) {
-      const a = resolveChain(buf(), r.ptr);
+      const a = resolveChain(buf(), r.ptr, (i) => inst.globalValue(i));
       if (a === null) throw new ScriptError(`pointer path of '${r.name}' does not resolve right now (game not in the right state?)`);
       return a;
     }

@@ -8,10 +8,15 @@
  * The result is a Chain: read u32 at `base`, then for every offset except the last read u32 at (value+offset);
  * the final address is value + lastOffset.
  */
-export interface Chain { base: number; offsets: number[] }
+export interface Chain {
+  base: number;
+  offsets: number[];
+  /** rooted in this Wasm global (written `$g12`) instead of a memory cell; `base` is -1 */
+  global?: number;
+}
 export type AddrExpr = { kind: "addr"; addr: number } | { kind: "ptr"; chain: Chain };
 
-type Node = { t: "num"; v: number } | { t: "deref"; e: Node } | { t: "add"; l: Node; k: number };
+type Node = { t: "num"; v: number } | { t: "glob"; i: number } | { t: "deref"; e: Node } | { t: "add"; l: Node; k: number };
 type Op = { d: true } | { a: number };
 
 class Parser {
@@ -55,6 +60,8 @@ class Parser {
       return e;
     }
     this.ws();
+    const gm = /^\$?g(\d+)\b/i.exec(this.s.slice(this.i));
+    if (gm && (this.s[this.i] === "$" || /^g\d/i.test(this.s.slice(this.i)))) { this.i += gm[0].length; return { t: "glob", i: Number(gm[1]) }; }
     const m = /^(?:0x[0-9a-f_]+|[0-9][0-9a-f]*h(?![0-9a-z])|\d[\d_]*)/i.exec(this.s.slice(this.i));
     if (!m) this.err("expected a number or [");
     this.i += m![0].length;
@@ -65,6 +72,7 @@ class Parser {
 
 /** Evaluate left to right: returns the base number and the ordered pointer-read / add operations. */
 function walk(n: Node, ops: Op[]): number {
+  if (n.t === "glob") throw new Error("global roots are handled separately");
   if (n.t === "num") return n.v;
   if (n.t === "deref") {
     const b = walk(n.e, ops);
@@ -77,10 +85,29 @@ function walk(n: Node, ops: Op[]): number {
   return b;
 }
 
+/** `[$g12+0x34]+0x18`: value of Wasm global 12, +0x34, read a pointer, +0x18 */
+function globalRoot(n: Node, ops: Op[]): number | null {
+  if (n.t === "glob") return n.i;
+  if (n.t === "num") return null;
+  const r = globalRoot(n.t === "deref" ? n.e : n.l, ops);
+  if (r === null) return null;
+  ops.push(n.t === "deref" ? { d: true } : { a: n.k });
+  return r;
+}
+
 export function parseAddressExpr(text: string): AddrExpr {
   const s = text.trim();
   if (!s) throw new Error("empty address");
   const tree = new Parser(s).parse();
+  const gops: Op[] = [];
+  const g = globalRoot(tree, gops);
+  if (g !== null) {
+    const offsets: number[] = [];
+    let cur = 0;
+    for (const o of gops) { if ("d" in o) { offsets.push(cur); cur = 0; } else cur += o.a; }
+    offsets.push(cur);
+    return { kind: "ptr", chain: { base: -1, global: g, offsets } };
+  }
   const ops: Op[] = [];
   const base = walk(tree, ops);
   if (!ops.length) return { kind: "addr", addr: base };
@@ -94,7 +121,7 @@ export function parseAddressExpr(text: string): AddrExpr {
 
 export function formatChain(c: Chain): string {
   const h = (n: number) => (n < 0 ? "-0x" + (-n).toString(16) : "+0x" + n.toString(16));
-  let s = `[0x${c.base.toString(16)}]`;
+  let s = c.global !== undefined ? `$g${c.global}` : `[0x${c.base.toString(16)}]`;
   for (let i = 0; i < c.offsets.length - 1; i++) s = `[${s}${h(c.offsets[i]!)}]`;
   const last = c.offsets[c.offsets.length - 1]!;
   return last === 0 ? s : `${s}${h(last)}`;

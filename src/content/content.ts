@@ -31,6 +31,7 @@ if (!(window as any)[FLAG]) {
             funcSlots: clamp(o.funcSlots ?? 8, 0, 16),
           },
           patches, pauseOnHit: !!o.pauseOnHit, logLevel: o.logLevel ?? 0,
+          sharedCtrl: Number.isInteger(o.sharedCtrl) && o.sharedCtrl >= 8 && (o.sharedCtrl & 7) === 0 ? o.sharedCtrl : 0x20,
           lineBps: ((r?.cetusPageData?.[pageKey()]?.lineBps ?? []) as any[]).filter((b) => Number.isInteger(b?.func) && Number.isInteger(b?.off)).map((b) => ({ func: b.func, off: b.off, enabled: b.enabled !== false, cond: b.cond || "", pause: !!b.pause })),
         });
         pushConfig();

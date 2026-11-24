@@ -153,11 +153,11 @@ export interface Bookmark {
   /** text rows (str8 / str16): maximum size in bytes including the terminator */
   len?: number;
   /** pointer path: address = [[base]+o1]+o2… resolved live, so it survives game restarts */
-  ptr?: { base: number; offsets: number[] };
+  ptr?: { base: number; offsets: number[]; global?: number };
   /** other chains found by the pointer scan, kept so they can be narrowed after a restart */
-  ptrCandidates?: { base: number; offsets: number[] }[];
+  ptrCandidates?: { base: number; offsets: number[]; global?: number }[];
   /** settings of the scan that produced the candidates (so a later scan can use the same ones) */
-  ptrParams?: { maxOff: number; levels: number; staticLo: number; staticHi: number; maxFrontier: number; maxResults: number };
+  ptrParams?: { maxOff: number; levels: number; staticLo: number; staticHi: number; maxFrontier: number; maxResults: number; requireVtable?: boolean; useGlobals?: boolean };
 }
 export interface LineBp { func: number; off: number; enabled: boolean; cond?: string; pause?: boolean; text?: string }
 export interface PageData { bookmarks: Bookmark[]; names: Record<string, string>; breakpoints: number[]; baseline?: number[] | undefined; lineBps: LineBp[] }
@@ -185,8 +185,10 @@ export async function savePatches(p: SavedPatch[]): Promise<void> {
 export interface Options {
   enabled: boolean; openMode: "tab" | "window"; wpCount: number; enableWatchpoints: number;
   funcHooks: boolean; funcSlots: number; pauseOnHit: boolean; logLevel: number;
+  /** address of the shared-memory watch table for threaded modules (default 0x20) */
+  sharedCtrl: number;
 }
-export const DEFAULT_OPTIONS: Options = { enabled: true, openMode: "tab", wpCount: 8, enableWatchpoints: 7, funcHooks: true, funcSlots: 8, pauseOnHit: false, logLevel: 0 };
+export const DEFAULT_OPTIONS: Options = { enabled: true, openMode: "tab", wpCount: 8, enableWatchpoints: 7, funcHooks: true, funcSlots: 8, pauseOnHit: false, logLevel: 0, sharedCtrl: 0x20 };
 export async function loadOptions(): Promise<Options> {
   const o = ((await chrome.storage.local.get("savedOptions")).savedOptions ?? {}) as Partial<Options>;
   return { ...DEFAULT_OPTIONS, ...o };

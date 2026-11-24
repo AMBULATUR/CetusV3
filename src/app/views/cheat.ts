@@ -9,15 +9,17 @@ import { rowIdentifier } from "../../page/script";
 const ROW_TYPES: [string, string][] = [...VAL_TYPES.map((t) => [t, t] as [string, string]), ["str8", "text (utf-8)"], ["str16", "text (utf-16)"]];
 const isText = (t: string) => t === "str8" || t === "str16";
 
-type Chain = { base: number; offsets: number[] };
+type Chain = { base: number; offsets: number[]; global?: number };
 type PRow = Chain & { now: number | null; v: any };
 
 export function fmtChain(c: Chain): string {
-  let s = `[${hex(c.base, 4)}]`;
+  let s = c.global !== undefined ? `$g${c.global}` : `[${hex(c.base, 4)}]`;
   for (let i = 0; i < c.offsets.length - 1; i++) s = `[${s}+0x${c.offsets[i]!.toString(16)}]`;
   return `${s}+0x${c.offsets[c.offsets.length - 1]!.toString(16)}`;
 }
-const chainKey = (c: Chain) => `${c.base}:${c.offsets.join(",")}`;
+const chainKey = (c: Chain) => `${c.global !== undefined ? "g" + c.global : c.base}:${c.offsets.join(",")}`;
+const rootKey = (c: Chain) => (c.global !== undefined ? "g" + c.global : String(c.base));
+const plain = (c: Chain): Chain => ({ base: c.base, offsets: [...c.offsets], ...(c.global !== undefined ? { global: c.global } : {}) });
 
 export function cheatView(ctx: Ctx): View {
   const res = new Map<string, { a: number; v: string | null }>();
@@ -223,6 +225,10 @@ export function cheatView(ctx: Ctx): View {
     breadth.title = "how many intermediate pointers to keep per level (higher = finds more, slower, more memory)";
     const cap = select<string>([["5000", "keep 5k paths"], ["20000", "keep 20k paths"], ["50000", "keep 50k paths"]], String(sp?.maxResults ?? 5000));
     const status = h("span", { class: "muted" });
+    const vtChk = h("input", { type: "checkbox", checked: !!sp?.requireVtable });
+    const vtLbl = h("label", { class: "chk", title: "Keep only objects whose first word ([base]) points into static .rodata/.data, i.e. has a vtable. Removes heap noise and linked-list nodes in C++ heaps." }, vtChk, "Require vtable at object base");
+    const glChk = h("input", { type: "checkbox", checked: sp?.useGlobals !== false });
+    const glLbl = h("label", { class: "chk", title: "Also treat Wasm i32 globals that hold a pointer as chain roots (written $g12 in paths), next to static memory cells." }, glChk, "Wasm globals as roots");
     let range: any = null;
     const rangeInfo = h("div", { class: "muted" });
     const preset = select<string>([["", "range presets…"], ["det", "detected static end"], ["p4", "detected + 4 MiB"], ["p64", "detected + 64 MiB"], ["all", "whole memory (slow, noisy)"]], "", (v) => {
@@ -279,16 +285,16 @@ export function cheatView(ctx: Ctx): View {
     }
 
     const use = (r: Chain) => {
-      b.ptr = { base: r.base, offsets: [...r.offsets] };
+      b.ptr = plain(r);
       void ctx.saveData(); render(); toast("Saved pointer path: " + fmtChain(r), "ok", 4000); close();
     };
     const keep = async () => {
       const r = await rpc("ptr.results", { offset: 0, limit: 5000 });
       if (!r.rows.length) return toast("no scan results to keep", "info");
-      b.ptrCandidates = r.rows.map((x: any) => ({ base: x.base, offsets: x.offsets }));
+      b.ptrCandidates = r.rows.map((x: any) => plain(x));
       void ctx.saveData(); toast(`Kept ${b.ptrCandidates!.length} candidate paths on this entry`, "ok"); showTab("saved");
     };
-    const params = () => ({ maxOff: parseNum(maxOff.value), levels: Number(levels.value), staticLo: parseNum(lo.value), staticHi: parseNum(hi.value), maxFrontier: Number(breadth.value), maxResults: Number(cap.value) });
+    const params = () => ({ maxOff: parseNum(maxOff.value), levels: Number(levels.value), staticLo: parseNum(lo.value), staticHi: parseNum(hi.value), maxFrontier: Number(breadth.value), maxResults: Number(cap.value), requireVtable: vtChk.checked, useGlobals: glChk.checked });
 
     async function runScan(addr: number): Promise<{ capped: boolean; error: string | null }> {
       const p = params();
@@ -299,7 +305,7 @@ export function cheatView(ctx: Ctx): View {
       for (;;) {
         s = await rpc("ptr.status");
         bar.value = s.progress;
-        status.textContent = s.error ? `error: ${s.error}` : `level ${s.level} · ${s.results.toLocaleString()} path(s)${s.capped ? " · capped" : ""}${s.running ? "" : " · done"}`;
+        status.textContent = s.error ? `error: ${s.error}` : `level ${s.level} · ${s.results.toLocaleString()} path(s)${s.capped ? " · capped" : ""}${s.indexed ? ` · ${s.indexed.toLocaleString()} pointers indexed` : ""}${s.vtableRejected ? ` · ${s.vtableRejected.toLocaleString()} dropped by vtable filter` : ""}${s.running ? "" : " · done"}`;
         if (!s.running || closed) break;
         if (mode === "scan") await refreshTable();
         await new Promise((r) => setTimeout(r, 400));
@@ -335,12 +341,12 @@ export function cheatView(ctx: Ctx): View {
         for (let off = 0; ; off += 5000) { const r = await rpc("ptr.results", { offset: off, limit: 5000 }); all.push(...r.rows); if (all.length >= r.total || !r.rows.length) break; }
         const keys = new Set(saved.map(chainKey));
         const common = all.filter((c) => keys.has(chainKey(c)));
-        const savedBases = new Set(saved.map((c) => c.base));
-        const sameBase = all.filter((c) => savedBases.has(c.base) && !keys.has(chainKey(c)));
+        const savedBases = new Set(saved.map(rootKey));
+        const sameBase = all.filter((c) => savedBases.has(rootKey(c)) && !keys.has(chainKey(c)));
         if (common.length) {
           note.replaceChildren(h("div", { class: "banner info" }, `${common.length} path(s) are identical in both runs — those are stable. `, h("button", { class: "primary", onclick: () => { b.ptrCandidates = common; b.ptr = common[0]!; void ctx.saveData(); render(); toast(`Using the best of ${common.length} stable paths`, "ok"); close(); } }, "Keep these & use the shortest")));
         } else if (sameBase.length) {
-          note.replaceChildren(h("div", { class: "banner" }, `No identical path, but ${new Set(sameBase.map((c) => c.base)).size} static cell(s) lead to your value in BOTH runs with different offsets (for example ${fmtChain(sameBase[0]!)}). The root is right but the object layout differs between runs — pick the matching value again (same kind of object) or raise Max offset / levels.`));
+          note.replaceChildren(h("div", { class: "banner" }, `No identical path, but ${new Set(sameBase.map(rootKey)).size} static root(s) lead to your value in BOTH runs with different offsets (for example ${fmtChain(sameBase[0]!)}). The root is right but the object layout differs between runs — pick the matching value again (same kind of object) or raise Max offset / levels.`));
         } else {
           note.replaceChildren(h("div", { class: "banner err" }, `No overlap at all between the ${saved.length} saved paths and the ${all.length} found now${out.capped ? " (the scan was capped — raise breadth)" : ""}. The first scan's paths were rooted in memory that is not static, or this run's value is a different object. Use “detected static end” (or +4 MiB) for the range, scan again in each run and compare.`));
         }
@@ -363,7 +369,8 @@ export function cheatView(ctx: Ctx): View {
     body.append(
       h("div", { class: "muted" }, "Heap addresses change every run. This finds chains that start in static memory and lead to the target, so the entry can be re-resolved after a restart. Candidates and their settings are saved on the entry."),
       h("div", { class: "row" }, field("Target now", h("span", { class: "mono" }, target >= 0 ? hex(target) : "unresolved")), field("Max offset", maxOff), field("Levels", levels), field("Static range from", lo), field("to", hi), preset),
-      h("div", { class: "row" }, breadth, cap, scanBtn, cancelBtn, bar),
+      h("div", { class: "row" }, breadth, cap, vtLbl, glLbl),
+      h("div", { class: "row" }, scanBtn, cancelBtn, bar),
       rangeInfo,
       h("div", { class: "row", style: { borderTop: "1px solid var(--line)", paddingTop: "8px" } }, h("b", null, "After a restart:"), field("Real address of the value now", realAddr), compareBtn, h("span", { class: "muted" }, "(find the value with the Scanner first)")),
       note,
@@ -407,7 +414,7 @@ export function cheatView(ctx: Ctx): View {
         const target = existing ?? ({ id: Math.random().toString(36).slice(2), addr: 0, type: "i32", desc: "", freeze: false, freezeMode: "hard" } as Bookmark);
         if (existing && existing.freeze) { void rpc("cheat.release", { addr: eff(existing), size: sizeOf(existing) }).catch(() => {}); existing.freeze = false; delete existing.freezeValue; }
         target.type = t.value; target.desc = d.value.trim();
-        if (parsed.kind === "addr") { target.addr = parsed.addr; delete target.ptr; } else { target.ptr = { base: parsed.chain.base, offsets: parsed.chain.offsets }; delete target.ptrCandidates; res.delete(target.id); }
+        if (parsed.kind === "addr") { target.addr = parsed.addr; delete target.ptr; } else { target.ptr = { base: parsed.chain.base, offsets: parsed.chain.offsets, ...(parsed.chain.global !== undefined ? { global: parsed.chain.global } : {}) }; delete target.ptrCandidates; res.delete(target.id); }
         if (isText(t.value)) {
           let cap = Number(len.value) | 0;
           if (!cap) { try { const r: any[] = await rpc("cheat.poll", { items: [{ ...(parsed.kind === "ptr" ? { ptr: parsed.chain } : { addr: parsed.addr }), type: t.value, len: 4096 }] }); cap = Math.max(2, String(r[0]?.v ?? "").length * (t.value === "str16" ? 2 : 1) + (t.value === "str16" ? 2 : 1)); } catch { cap = 32; } }

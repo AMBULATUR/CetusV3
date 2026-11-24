@@ -1,6 +1,5 @@
 import { ModuleRec, PageConfig } from "./module-rec";
 import { CetusInstance, Emit } from "./instance";
-import { rewriteModule } from "../wasm/rewrite";
 
 export interface Registry {
   instances: CetusInstance[];
@@ -84,13 +83,20 @@ export function installHooks(opts: {
     if (rec.plain) return Promise.resolve(rec.plain);
     if (!rec.plainP) {
       rec.plainP = (async () => {
-        let bytes: Uint8Array = rec.orig;
-        if (rec.patchList.length) {
-          try { bytes = rewriteModule(rec.model!, { instrument: null, patches: rec.patchList }).bytes; } catch { bytes = rec.orig; }
-        }
+        const wb = rec.workerBytes();
+        let bytes = wb.bytes;
         try {
-          rec.plain = await N.compile(bytes as BufferSource);
-          opts.log(`worker-safe module ready (${bytes.length} bytes)`);
+          try {
+            rec.plain = await N.compile(bytes as BufferSource);
+            rec.plainKind = wb.instrumented ? "instrumented" : "plain";
+          } catch (e) {
+            if (!wb.instrumented) throw e;
+            console.warn("[cetus] instrumented worker build did not compile; workers get the plain module", e);
+            bytes = rec.orig;
+            rec.plain = await N.compile(bytes as BufferSource);
+            rec.plainKind = "plain";
+          }
+          opts.log(`worker module ready (${rec.plainKind}, ${bytes.length} bytes)` + (rec.plainKind === "instrumented" ? ` — watchpoints are shared via linear memory @0x${rec.sharedCtrl.toString(16)}` : ""));
         } catch (e) {
           console.error("[cetus] could not build the worker-safe module; workers would receive the instrumented one", e);
           rec.plain = null;

@@ -1,4 +1,4 @@
-import { h, toast, errMsg, field, select, fmtBytes } from "../ui";
+import { h, toast, errMsg, field, select, fmtBytes, parseNum } from "../ui";
 import { rpc, reloadTarget, loadOptions, saveOptions, Options, DEFAULT_OPTIONS, getUi, saveUi, onUi, DEFAULT_UI, UiSettings } from "../api";
 import { Ctx, View } from "../ctx";
 
@@ -30,6 +30,18 @@ export function toolsView(ctx: Ctx): View {
       h("label", { class: "chk", title: "instrument stores (write watchpoints and hard freeze). Very cheap when no watch is active." }, (() => { const i = h("input", { type: "checkbox", checked: !!(opts.enableWatchpoints & 6) }); i.onchange = () => { opts.enableWatchpoints = i.checked ? opts.enableWatchpoints | 6 : opts.enableWatchpoints & ~6; }; return i; })(), "Instrument memory writes (write watchpoints, hard freeze)"),
       cb("Instrument function entries (breakpoints, call trace)", "funcHooks"),
       cb("Pause in DevTools on every hit (runs `debugger;`)", "pauseOnHit", "open DevTools on the target page first"),
+      (() => {
+        const i = h("input", { type: "text", class: "mono", value: "0x" + opts.sharedCtrl.toString(16), style: { width: "90px" } });
+        const bad = h("span", { class: "warn" });
+        i.oninput = () => {
+          try {
+            const v = parseNum(i.value);
+            if (!Number.isInteger(v) || v < 8 || (v & 7) !== 0) throw new Error("must be a multiple of 8 and at least 0x8");
+            opts.sharedCtrl = v; bad.textContent = "";
+          } catch (e) { bad.textContent = errMsg(e); }
+        };
+        return h("div", { class: "stack" }, field("Shared watch table address (threaded apps)", i, "Where multi-threaded (shared-memory) modules keep their watchpoint table: 800 bytes in linear memory, default 0x20. Change it if the app uses low memory there; Cetus falls back automatically if a data segment overlaps."), bad);
+      })(),
       field("Console logging", select<string>([["0", "off"], ["1", "verbose"]], String(opts.logLevel), (v) => (opts.logLevel = Number(v)))),
       h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => { await saveOptions(opts); toast("Saved. Instrumentation options apply to pages loaded afterwards — reload the target tab.", "ok", 5000); } }, "Save settings"),
         h("button", { onclick: () => void reloadTarget() }, "Reload target tab")));

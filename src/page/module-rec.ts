@@ -1,5 +1,5 @@
 import { ModuleModel, parseModule } from "../wasm/module";
-import { rewriteModule, RewriteResult, FunctionPatch, InstrumentConfig, BpRequest } from "../wasm/rewrite";
+import { rewriteModule, RewriteResult, FunctionPatch, InstrumentConfig, BpRequest, CTRL } from "../wasm/rewrite";
 import { fromHex, fromBase64 } from "../wasm/leb";
 import { Analysis, analyze } from "../wasm/analysis";
 
@@ -29,6 +29,8 @@ export interface PageConfig {
   logLevel: number;
   /** line breakpoints saved for this page (compiled in at load time) */
   lineBps: { func: number; off: number; enabled: boolean; cond?: string; pause?: boolean }[];
+  /** where threaded (shared-memory) modules keep their watch table; must be a free, 8-byte aligned address */
+  sharedCtrl?: number;
 }
 
 export const DEFAULT_CONFIG: PageConfig = {
@@ -79,8 +81,15 @@ export class ModuleRec {
   userNames = new Map<number, string>();
   /** patches this record was built with (the worker-safe plain build re-applies them) */
   patchList: FunctionPatch[] = [];
-  /** un-instrumented compiled module handed to Web Workers (they have no Cetus hooks) */
+  /**
+   * Module handed to Web Workers. For threaded builds this is the import-free "worker-safe" instrumented
+   * module (watchpoints armed in shared memory fire inside workers); otherwise the plain original.
+   */
   plain: WebAssembly.Module | null = null;
+  /** what `plain` is: "instrumented" (ring-buffer build) or "plain" */
+  plainKind: "instrumented" | "plain" | null = null;
+  instrument: InstrumentConfig | null = null;
+  sharedCtrl: number = CTRL.DEFAULT_ADDR;
   /** pending async compile of the plain build (sync compile is capped at 8 MB on the main thread) */
   plainP: Promise<WebAssembly.Module | null> | null = null;
 
@@ -91,6 +100,8 @@ export class ModuleRec {
     let patches: FunctionPatch[] = [];
     try { patches = collectPatches(cfg.patches); } catch (e) { this.notes.push("patch error: " + (e as Error).message); }
     this.patchList = patches;
+    this.instrument = cfg.instrument;
+    this.sharedCtrl = cfg.sharedCtrl ?? CTRL.DEFAULT_ADDR;
     try {
       this.model = parseModule(this.orig);
       this.notes.push(...this.model.warnings);
@@ -108,7 +119,7 @@ export class ModuleRec {
     ];
     for (const a of attempts) {
       try {
-        const rr = rewriteModule(this.model, { instrument: a.cfg, patches: a.patches, bps: a.bps });
+        const rr = rewriteModule(this.model, { instrument: a.cfg, patches: a.patches, bps: a.bps, shared: { ctrl: this.sharedCtrl } });
         if (!WebAssembly.validate(rr.bytes as BufferSource)) {
           let why = "validation failed";
           try { new WebAssembly.Module(rr.bytes as BufferSource); } catch (e) { why = (e as Error).message; }
@@ -139,4 +150,26 @@ export class ModuleRec {
   }
 
   get K(): number { return this.rr?.K ?? 0; }
+
+  /**
+   * Bytes for the module that Web Workers receive via postMessage. Workers run no Cetus code, so the module
+   * must not import `__cetus`. If the main build keeps its watch table in shared memory we can still give
+   * workers an instrumented build (hits go to the ring buffer); otherwise they get the plain module.
+   */
+  workerBytes(): { bytes: Uint8Array; instrumented: boolean } {
+    if (this.model && this.rr?.shared && this.instrument) {
+      try {
+        const rr = rewriteModule(this.model, { instrument: { ...this.instrument, funcHooks: false }, patches: this.patchList, shared: { ctrl: this.rr.shared.ctrl, ring: true } });
+        if (rr.shared?.ring && rr.K === 0 && WebAssembly.validate(rr.bytes as BufferSource)) return { bytes: rr.bytes, instrumented: true };
+        this.notes.push("worker-safe instrumented build was not produced; workers get the plain module");
+      } catch (e) {
+        this.notes.push("worker-safe build failed: " + (e as Error).message);
+      }
+    }
+    let bytes: Uint8Array = this.orig;
+    if (this.patchList.length && this.model) {
+      try { bytes = rewriteModule(this.model, { instrument: null, patches: this.patchList }).bytes; } catch { bytes = this.orig; }
+    }
+    return { bytes, instrumented: false };
+  }
 }
