@@ -115,6 +115,7 @@ export class CetusInstance {
       if (st.cond) { try { st.condFn = compileCondition(st.cond, BP_VARS); } catch { st.cond = ""; } }
       return st;
     });
+    if (this.wm) { this.bpState.forEach((st, i) => this.wm!.setBpEnabled(i, st.enabled)); this.syncRingPoll(); }
   }
 
   get features() {
@@ -404,7 +405,7 @@ export class CetusInstance {
 
   /** Hits from Web Workers cannot call into this realm: they land in the ring buffer, which we poll while anything is armed. */
   private syncRingPoll(): void {
-    const armed = this.slots.some(Boolean);
+    const armed = this.slots.some(Boolean) || this.bpState.some((s) => s.enabled);
     if (armed && !this.ringTimer) this.ringTimer = setInterval(() => this.pollRing(), 100);
     else if (!armed && this.ringTimer) { this.pollRing(); clearInterval(this.ringTimer); this.ringTimer = null; }
   }
@@ -418,6 +419,7 @@ export class CetusInstance {
     for (const h of hits) {
       const s = this.slots[h.slot];
       const frame: Frame = { fn: h.func, off: 0, origOff: h.off, name: this.funcName(h.func) };
+      if (h.kind === 3) { this.onBp(h.slot, h.ea, h.bits ?? 0n, [frame]); continue; }
       this.record(h.kind === 1 ? "read" : "write", h.slot, s?.addr ?? h.ea, [frame]);
     }
   }
@@ -715,12 +717,16 @@ export class CetusInstance {
   op_script_list() { return [...this.scripts.runs.values()].map((r) => ({ id: r.id, name: r.name, running: r.running })); }
 
   // ---- line breakpoints --------------------------------------------------------------
-  private onBp(id: number, ea: number, bits: bigint): void {
+  /**
+   * `frames` is set for hits that came from a Web Worker through the ring buffer: they have no JS stack, no locals,
+   * and were already counted by the shared counter, and the store's old value is unknowable after the fact.
+   */
+  private onBp(id: number, ea: number, bits: bigint, frames?: Frame[]): void {
     const st = this.bpState[id];
     const f = this.rec.rr?.bp.found[id];
     this.curBp = null;
     if (!st || !f) return;
-    st.count++;
+    if (!frames) st.count++;
     const now = Date.now();
     if (now - st.rate.t > 1000) { st.rate.t = now; st.rate.n = 0; }
     if (++st.rate.n > 200) return; // hot line: keep counting, stop capturing
@@ -730,7 +736,7 @@ export class CetusInstance {
     let old: bigint | null = null;
     if (f.kind !== "generic") {
       value = BigInt.asUintN(size * 8, bits);
-      if (f.kind === "store" && this.memory && ea >= 0 && ea + size <= this.memory.buffer.byteLength) {
+      if (f.kind === "store" && !frames && this.memory && ea >= 0 && ea + size <= this.memory.buffer.byteLength) {
         const dv = this.dv();
         old = size === 8 ? dv.getBigUint64(ea, true) : BigInt(size === 4 ? dv.getUint32(ea, true) : size === 2 ? dv.getUint16(ea, true) : dv.getUint8(ea));
       }
@@ -744,11 +750,11 @@ export class CetusInstance {
     if (st.condFn) {
       try { if (!st.condFn({ ea: ea >>> 0, value: num(value), old: num(old), size, func: f.func, off: f.off })) return; } catch { return; }
     }
-    const hit: BpHit = { n: this.bpSeq++, id, t: now, ea: ea >>> 0, value: value === null ? null : value.toString(), old: old === null ? null : old.toString(), frames: this.capture(), locals: [] };
+    const hit: BpHit = { n: this.bpSeq++, id, t: now, ea: ea >>> 0, value: value === null ? null : value.toString(), old: old === null ? null : old.toString(), frames: frames ?? this.capture(), locals: [] };
     this.bpHits.push(hit);
     if (this.bpHits.length > 500) this.bpHits.shift();
-    this.curBp = hit;
-    if (st.pause) {
+    this.curBp = frames ? null : hit;
+    if (st.pause && !frames) {
       // eslint-disable-next-line no-debugger
       debugger;
     }
@@ -764,7 +770,7 @@ export class CetusInstance {
       const f: BpFound | null = rr!.bp.found[id] ?? null;
       const st = this.bpState[id]!;
       const flag = this.exps[rr!.bp.flagNames[id]!];
-      return { id, func: q.func, off: q.off, fn: this.funcName(q.func), found: !!f, name: f?.name ?? "", kind: f?.kind ?? "generic", size: f?.size ?? 0, valType: f?.valType ?? 0, offset: f?.offset ?? 0, localCodes: f?.localCodes ?? [], enabled: flag ? !!flag.value : st.enabled, cond: st.cond, pause: st.pause, count: st.count };
+      return { id, func: q.func, off: q.off, fn: this.funcName(q.func), found: !!f, name: f?.name ?? "", kind: f?.kind ?? "generic", size: f?.size ?? 0, valType: f?.valType ?? 0, offset: f?.offset ?? 0, localCodes: f?.localCodes ?? [], enabled: flag ? !!flag.value : st.enabled, cond: st.cond, pause: st.pause, count: st.count + (this.wm && id < 32 ? this.wm.bpCount(id) : 0) };
     });
   }
   op_bp_config(a: { func: number; off: number; enabled?: boolean; cond?: string; pause?: boolean }) {
@@ -776,7 +782,13 @@ export class CetusInstance {
       if (a.cond.trim()) { st.condFn = compileCondition(a.cond, BP_VARS); st.cond = a.cond.trim(); } else { st.condFn = null; st.cond = ""; }
     }
     if (a.pause !== undefined) st.pause = a.pause;
-    if (a.enabled !== undefined) { st.enabled = a.enabled; const g = this.exps[rr!.bp.flagNames[id]!]; if (g) g.value = a.enabled ? 1 : 0; }
+    if (a.enabled !== undefined) {
+      st.enabled = a.enabled;
+      const g = this.exps[rr!.bp.flagNames[id]!];
+      if (g) g.value = a.enabled ? 1 : 0;
+      this.wm?.setBpEnabled(id, a.enabled); // Web Workers read the flag from shared memory
+      if (this.wm) this.syncRingPoll();
+    }
     return true;
   }
   op_bp_hits(a: { func?: number; limit?: number }) {
@@ -785,7 +797,7 @@ export class CetusInstance {
     return rows;
   }
   op_bp_poll(a: { func?: number; limit?: number }) { return { sites: this.op_bp_sites(), hits: this.op_bp_hits(a) }; }
-  op_bp_clear() { this.bpHits.length = 0; for (const s of this.bpState) s.count = 0; return true; }
+  op_bp_clear() { this.bpHits.length = 0; for (const s of this.bpState) s.count = 0; this.wm?.clearBpCounts(); return true; }
 
   // ---- speedhack ----------------------------------------------------------
   op_speed_set(a: { multiplier: number }) { speedhack.set(Number(a.multiplier)); return speedhack.multiplier; }
@@ -912,13 +924,10 @@ export class CetusInstance {
       return { index: idx, name: this.funcName(idx), imported: true, sig: funcTypeString(m.types[m.funcTypeIdx[idx]!]), lines: [], locals: [], import: imp ? `${imp.module}.${imp.field}` : "", text: "" };
     }
     const b = m.bodies[bi]!;
-    const d = disassembleBody(m.bytes, b.start, b.end, { funcName: (i) => this.funcName(i) });
-    for (const l of d.lines) {
-      if (l.i32 !== undefined && !l.comment) {
-        const s = this.cstringAt(l.i32);
-        if (s) l.comment = JSON.stringify(s);
-      }
-    }
+    const d = disassembleBody(m.bytes, b.start, b.end, {
+      funcName: (i) => this.funcName(i),
+      i32Comment: (v) => { const s = this.cstringAt(v); return s ? JSON.stringify(s) : undefined; },
+    });
     return {
       index: idx, name: this.funcName(idx), imported: false, sig: funcTypeString(m.types[m.funcTypeIdx[idx]!]), size: b.end - b.start,
       locals: d.locals, error: d.error ?? null,

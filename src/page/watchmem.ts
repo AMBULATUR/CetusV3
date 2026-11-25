@@ -8,9 +8,12 @@
 import { CTRL } from "../wasm/rewrite";
 
 export interface RingHit {
-  /** 1 = read, 2 = write */
-  kind: 1 | 2;
+  /** 1 = read watch, 2 = write watch, 3 = line breakpoint */
+  kind: 1 | 2 | 3;
+  /** watch slot (kinds 1/2) or line-breakpoint id (kind 3) */
   slot: number;
+  /** kind 3: the value the instruction loaded / is storing, as 64-bit bits */
+  bits?: bigint;
   /** effective address (reads) or the watched address (writes) */
   ea: number;
   /** ORIGINAL function index that performed the access */
@@ -76,13 +79,30 @@ export class WatchMem {
       const commit = this.rd(a, e + 16) >>> 0;
       if (commit === ((seq + 1) >>> 0)) {
         const w0 = a[e >> 2]!;
-        out.push({ kind: (w0 & 0xff) as 1 | 2, slot: (w0 >> 8) & 0xff, ea: a[(e + 4) >> 2]! >>> 0, func: a[(e + 8) >> 2]!, off: a[(e + 12) >> 2]!, seq });
+        const kind = (w0 & 0xff) as 1 | 2 | 3;
+        const hit: RingHit = { kind, slot: (w0 >> 8) & 0xff, ea: a[(e + 4) >> 2]! >>> 0, func: a[(e + 8) >> 2]!, off: a[(e + 12) >> 2]!, seq };
+        if (kind === 3) hit.bits = (BigInt(a[(e + 24) >> 2]! >>> 0) << 32n) | BigInt(a[(e + 20) >> 2]! >>> 0);
+        out.push(hit);
       } else if (commit > ((seq + 1) >>> 0) || head - seq > CTRL.RING_N) {
         this.lost++; // overwritten by a later lap
       } else break; // the writer claimed this entry but has not committed yet: pick it up next poll
       this.tail++;
     }
     return out;
+  }
+  /** line breakpoints: enable byte read by worker builds, and the exact pass counter they bump */
+  setBpEnabled(id: number, on: boolean): void {
+    if (id < 0 || id >= CTRL.MAX_BPS) return;
+    const b = new Uint8Array(this.memory.buffer, this.ctrl + CTRL.BPFLAGS + id, 1);
+    if (this.shared()) Atomics.store(b, 0, on ? 1 : 0); else b[0] = on ? 1 : 0;
+  }
+  bpCount(id: number): number {
+    if (id < 0 || id >= CTRL.MAX_BPS) return 0;
+    return this.rd(this.i32(), this.ctrl + CTRL.BPCNT + id * 4) >>> 0;
+  }
+  clearBpCounts(): void {
+    const a = this.i32();
+    for (let i = 0; i < CTRL.MAX_BPS; i++) this.wr(a, this.ctrl + CTRL.BPCNT + i * 4, 0);
   }
   /** total hits ever claimed (including ones we lost) */
   total(): number { return this.rd(this.i32(), this.ctrl + CTRL.HEAD) >>> 0; }

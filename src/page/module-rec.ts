@@ -159,7 +159,7 @@ export class ModuleRec {
   workerBytes(): { bytes: Uint8Array; instrumented: boolean } {
     if (this.model && this.rr?.shared && this.instrument) {
       try {
-        const rr = rewriteModule(this.model, { instrument: { ...this.instrument, funcHooks: false }, patches: this.patchList, shared: { ctrl: this.rr.shared.ctrl, ring: true } });
+        const rr = rewriteModule(this.model, { instrument: { ...this.instrument, funcHooks: false }, patches: this.patchList, bps: this.rr.bp.reqs, shared: { ctrl: this.rr.shared.ctrl, ring: true } });
         if (rr.shared?.ring && rr.K === 0 && WebAssembly.validate(rr.bytes as BufferSource)) return { bytes: rr.bytes, instrumented: true };
         this.notes.push("worker-safe instrumented build was not produced; workers get the plain module");
       } catch (e) {

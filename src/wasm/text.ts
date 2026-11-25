@@ -93,6 +93,8 @@ export interface DisOptions {
   funcName?: (idx: number) => string | undefined;
   /** annotate branch targets */
   branchComments?: boolean;
+  /** hint for an `i32.const` operand (e.g. the C string it points at); lands in the line comment and in `text` */
+  i32Comment?: (value: number) => string | undefined;
 }
 
 export function disassembleBody(buf: Uint8Array, start: number, end: number, opts: DisOptions = {}): DisResult {
@@ -156,6 +158,11 @@ export function disassembleBody(buf: Uint8Array, start: number, end: number, opt
     if (opts.branchComments !== false) annotateBranches(lines, pairs);
   }
 
+  if (opts.i32Comment) {
+    for (const l of lines) {
+      if (l.i32 !== undefined && !l.comment) { const c = opts.i32Comment(l.i32); if (c) l.comment = c; }
+    }
+  }
   const out: string[] = [];
   if (locals.length) out.push(".locals " + locals.join(" "));
   for (const l of lines) {

@@ -61,7 +61,9 @@ export interface BpFound {
  *   +0x00 magic            +0x04 wen (write hooks on)   +0x08 ren (read hooks on)
  *   +0x0c ring head (atomic, claimed by hitting threads)
  *   +0x20 slot[0..7], 32 bytes each: addr, size, flags, -, val(i64 @ +16)
- *   +0x120 hit ring: 16 entries x 32 bytes: kind|slot<<8, ea, func, off, commit(seq+1)
+ *   +0x120 hit ring: 16 entries x 32 bytes: kind|slot<<8, ea, func, off, commit(seq+1), value lo, value hi
+ *          kind 1 = read watch, 2 = write watch, 3 = line breakpoint (slot = breakpoint id)
+ *   +0x320 line-breakpoint enable bytes (32)    +0x340 line-breakpoint hit counters (32 x u32, atomic)
  */
 export const CTRL = {
   MAGIC: 0x43455455,
@@ -74,7 +76,10 @@ export const CTRL = {
   RING: 0x20 + 8 * 32,
   RING_N: 16,
   RING_STRIDE: 32,
-  SIZE: 0x20 + 8 * 32 + 16 * 32,
+  BPFLAGS: 0x20 + 8 * 32 + 16 * 32,
+  BPCNT: 0x20 + 8 * 32 + 16 * 32 + 32,
+  MAX_BPS: 32,
+  SIZE: 0x20 + 8 * 32 + 16 * 32 + 32 + 32 * 4,
   DEFAULT_ADDR: 0x20,
 } as const;
 
@@ -138,7 +143,7 @@ export const IMPORT_MODULE = "__cetus";
 // ---------------------------------------------------------------------------
 // Helper function generation (assembled from text so it can be read & tested)
 // ---------------------------------------------------------------------------
-const T = { hit: 0, void: 1, wslot: 2, rcheck: 3, fcheck: 4, bp: 5, rcheckF: 6, record: 7, wslotF: 8 };
+const T = { hit: 0, void: 1, wslot: 2, rcheck: 3, fcheck: 4, bp: 5, rcheckF: 6, record: 7, wslotF: 8, recordBp: 9 };
 
 function bodyOf(text: string): Uint8Array {
   const a = assemble(text);
@@ -234,6 +239,67 @@ if
   end
 end
 local.get ${L}
+end`);
+}
+
+/**
+ * recordBp(id, ea, bits, func, off): a line breakpoint was reached in a worker. Counts the pass (atomic, so the
+ * Hits column is exact) and appends a kind-3 entry to the same ring the watchpoints use.
+ */
+function genRecordBp(ctrl: number): Uint8Array {
+  const ring = ctrl + CTRL.RING;
+  return bodyOf(`
+.locals i32 i32
+local.get 0
+i32.const 2
+i32.shl
+i32.const ${ctrl + CTRL.BPCNT}
+i32.add
+i32.const 1
+i32.atomic.rmw.add
+drop
+i32.const ${ctrl + CTRL.HEAD}
+i32.const 1
+i32.atomic.rmw.add
+local.tee 5
+i32.const ${CTRL.RING_N - 1}
+i32.and
+i32.const 5
+i32.shl
+i32.const ${ring}
+i32.add
+local.set 6
+local.get 6
+i32.const 3
+local.get 0
+i32.const 8
+i32.shl
+i32.or
+i32.store
+local.get 6
+local.get 1
+i32.store offset=4
+local.get 6
+local.get 3
+i32.store offset=8
+local.get 6
+local.get 4
+i32.store offset=12
+local.get 6
+local.get 2
+i32.wrap_i64
+i32.store offset=20
+local.get 6
+local.get 2
+i64.const 32
+i64.shr_u
+i32.wrap_i64
+i32.store offset=24
+local.get 6
+local.get 5
+i32.const 1
+i32.add
+i32.atomic.store offset=16
 end`);
 }
 
@@ -681,13 +747,20 @@ export function rewriteBody(
       const isLoad = simple && acc!.load && !acc!.store;
       const f: BpFound = { id: site.id, func: funcIdx, off: ins.pos - start, name: op.name, kind: isStore ? "store" : isLoad ? "load" : "generic", size: acc?.size ?? 0, valType: isStore || isLoad ? valCode : 0, offset: acc ? ins.offset : 0, localCodes: getLocalCodes().slice(0, 24) };
       ctx.found[site.id] = f;
+      const ringBp = !!ctx.shared?.ring;
+      // enabled? worker-safe build reads a byte of the shared control block, the main build a per-instance global
+      const guard = () => {
+        if (ringBp) cw.u8(0x41).s32(ctx.shared!.ctrl + CTRL.BPFLAGS + site.id).u8(0x2d).u32(0).u32(0).u8(0x04).u8(0x40);
+        else cw.u8(0x23).u32(site.flagIdx).u8(0x04).u8(0x40);
+      };
       const hook = (addrLocal: number, valLocal: number) => {
-        cw.u8(0x23).u32(site.flagIdx).u8(0x04).u8(0x40); // global.get flag; if
+        guard();
         cw.u8(0x41).s32(site.id); // id
         cw.u8(0x20).u32(addrLocal).u8(0x41).s32(ins.offset | 0).u8(0x6a); // ea = addr + offset
         cw.u8(0x20).u32(valLocal); emitToBits(cw, valCode); // value bits
+        if (ringBp) cw.u8(0x41).s32(funcIdx).u8(0x41).s32(ins.pos - start); // where we are
         cw.u8(0x10).u32(ctx.bpImport);
-        snapshot(site.id);
+        if (!ringBp) snapshot(site.id); // locals can only be reported through the import
         cw.u8(0x0b);
       };
       if (f.kind === "store") {
@@ -700,9 +773,11 @@ export function rewriteBody(
         cw.u8(0x22).u32(a); // local.tee addr (kept on the stack for the load)
         sitePost = () => { cw.u8(0x22).u32(v); hook(a, v); }; // after the load: tee value, report
       } else {
-        cw.u8(0x23).u32(site.flagIdx).u8(0x04).u8(0x40);
-        cw.u8(0x41).s32(site.id).u8(0x41).s32(0).u8(0x42).s64(0n).u8(0x10).u32(ctx.bpImport);
-        snapshot(site.id);
+        guard();
+        cw.u8(0x41).s32(site.id).u8(0x41).s32(0).u8(0x42).s64(0n);
+        if (ringBp) cw.u8(0x41).s32(funcIdx).u8(0x41).s32(ins.pos - start);
+        cw.u8(0x10).u32(ctx.bpImport);
+        if (!ringBp) snapshot(site.id);
         cw.u8(0x0b);
       }
     }
@@ -775,6 +850,7 @@ function typeBytes(): Uint8Array[] {
     Uint8Array.of(0x60, 5, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0), // rcheckF: (ea, offset, size, func, off) -> ()
     Uint8Array.of(0x60, 5, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0), // record: (kind, slot, ea, func, off) -> ()
     Uint8Array.of(0x60, 7, 0x7f, 0x7f, 0x7f, 0x7e, 0x7f, 0x7f, 0x7f, 1, 0x7e), // wslotF
+    Uint8Array.of(0x60, 5, 0x7f, 0x7f, 0x7e, 0x7f, 0x7f, 0), // recordBp: (id, ea, value bits, func, off) -> ()
   ];
 }
 
@@ -841,7 +917,8 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   const slots = doWrite || doRead ? Math.min(shared ? CTRL.MAX_SLOTS : 16, cfg!.slots) : 0;
   const funcSlots = doFunc ? Math.min(16, cfg!.funcSlots) : 0;
   // line breakpoints on patched functions would refer to patched code: only original bodies are supported
-  const bpReq = ring ? [] : (opts.bps ?? []).filter((b) => b.func >= m.numImportedFuncs && b.func - m.numImportedFuncs < m.bodies.length && !patches.has(b.func));
+  const bpReq = (opts.bps ?? []).filter((b) => b.func >= m.numImportedFuncs && b.func - m.numImportedFuncs < m.bodies.length && !patches.has(b.func));
+  if (ring && bpReq.length > CTRL.MAX_BPS) bpReq.length = CTRL.MAX_BPS; // ids stay stable: the main build uses the same list
   const hasBps = bpReq.length > 0;
   const active = doWrite || doRead || doFunc || hasBps;
   const K = active && !ring ? (hasBps ? 4 : 2) : 0;
@@ -919,9 +996,10 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   const sitesByFunc = new Map<number, Map<number, { id: number; flagIdx: number }>>();
   const flagNames: string[] = [];
   bpReq.forEach((b, id) => {
-    const flagIdx = addGlobal(0x7f, b.enabled ? 1 : 0);
+    // worker-safe build: the enable flag is a byte in the shared control block, not a per-instance global
+    const flagIdx = ring ? -1 : addGlobal(0x7f, b.enabled ? 1 : 0);
     const name = `__c_bpf${id}`;
-    exportGlobal(name, flagIdx);
+    if (!ring) exportGlobal(name, flagIdx);
     flagNames.push(name);
     let mm = sitesByFunc.get(b.func);
     if (!mm) sitesByFunc.set(b.func, (mm = new Map()));
@@ -962,6 +1040,11 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
       ? { type: T0 + (ring ? T.rcheckF : T.rcheck), body: genRcheckMem(shared.ctrl, HIT, slots, ring), name: "__cetus_rcheck" }
       : { type: T0 + T.rcheck, body: genRcheck(gidx, HIT, slots), name: "__cetus_rcheck" });
   }
+  let bpRecIdx = -1;
+  if (ring && hasBps) {
+    bpRecIdx = helperBase + helpers.length;
+    helpers.push({ type: T0 + T.recordBp, body: genRecordBp(shared!.ctrl), name: "__cetus_record_bp" });
+  }
   if (doFunc) {
     fcheckIdx = helperBase + helpers.length;
     helpers.push({ type: T0 + T.fcheck, body: genFcheck(gidx.fen, gidx.fbp, FHIT), name: "__cetus_fcheck" });
@@ -970,7 +1053,7 @@ export function rewriteModule(m: ModuleModel, opts: RewriteOptions = {}): Rewrit
   const ctx: BodyCtx = {
     m, N0, K, write: doWrite, read: doRead, funcHooks: doFunc,
     wenIdx: gidx.wen, renIdx: gidx.ren, fenIdx: gidx.fen, wcheckIdx, rcheckIdx, fcheckIdx,
-    sites: sitesByFunc, found, bpImport: N0 + 2, bplImport: N0 + 3, shared,
+    sites: sitesByFunc, found, bpImport: ring ? bpRecIdx : N0 + 2, bplImport: N0 + 3, shared,
   };
 
   // --- rewrite sections ----------------------------------------------------

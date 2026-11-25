@@ -3,6 +3,7 @@ import { rpc, loadPatches, savePatches, pageKey, reloadTarget, SavedPatch } from
 import { lineBpPanel } from "./linebp";
 import { Ctx, View } from "../ctx";
 import { assemble } from "../../wasm/text";
+import { formatListing, ListLine } from "../../shared/listing";
 import { hex as hexStr } from "../../wasm/leb";
 
 interface Line { off: number; indent: number; text: string; comment: string; target?: number; bytes: string }
@@ -20,6 +21,26 @@ export function codeView(ctx: Ctx): View {
   const title = h("div", { class: "grow" });
   const input = h("input", { type: "text", class: "mono", placeholder: "function # or name", style: { width: "220px" } });
   const listing = h("div", { class: "listing" });
+  const withBytes = h("input", { type: "checkbox", checked: true });
+  const header = () => (cur ? `${cur.name}  #${cur.index}  ${cur.sig}${cur.locals.length ? "\n.locals " + cur.locals.join(" ") : ""}` : "");
+  /** whole function, or only `rows` (the selection) */
+  const copyShown = (rows?: ListLine[]) => {
+    if (!cur || cur.imported) return;
+    const lines = rows ?? (cur.lines as ListLine[]);
+    void copyText(formatListing(lines, { bytes: withBytes.checked, ...(rows ? {} : { header: header() }) }));
+    toast(rows ? `copied ${rows.length} lines` : "copied", "ok", 1000);
+  };
+  // Ctrl+C over several rows: copy them as lines, not as one fragment per span (the cells are flex items, which
+  // browsers copy as separate lines: offset / bytes / instruction / hint each on their own)
+  listing.addEventListener("copy", (e) => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return;
+    const picked: ListLine[] = [];
+    for (const r of listing.querySelectorAll<HTMLElement>(".lrow[data-off]")) if (sel.containsNode(r, true)) { const l = rowLine.get(r); if (l) picked.push(l); }
+    if (picked.length < 2) return; // a partial selection inside one row: keep the default behaviour
+    e.preventDefault();
+    e.clipboardData?.setData("text/plain", formatListing(picked, { bytes: withBytes.checked }));
+  });
   const editor = h("textarea", { class: "editor", spellcheck: false, style: { display: "none" } });
   const callers = h("div", { class: "scroll", style: { maxHeight: "40%" } });
   const callees = h("div", { class: "scroll", style: { maxHeight: "40%" } });
@@ -61,6 +82,7 @@ export function codeView(ctx: Ctx): View {
       const row = h("div", { class: cls, dataset: { off: String(l.off) } },
         dot, h("span", { class: "off" }, "+" + l.off.toString(16).padStart(4, "0")), h("span", { class: "byt", title: l.bytes }, l.bytes), insEl,
         l.target !== undefined ? h("span", { class: "cmt" }, "→ ", link(l.comment || `func ${l.target}`, () => void open(l.target!), `go to function ${l.target}`)) : l.comment ? h("span", { class: "cmt" }, l.comment) : "");
+      rowLine.set(row, l);
       row.addEventListener("dblclick", () => { const m = /i32\.const (-?\d+)/.exec(l.text); if (m) ctx.openMemory(Number(m[1]) >>> 0); });
       if (hl === l.off) hlEl = row;
       frag.appendChild(row);
@@ -73,6 +95,7 @@ export function codeView(ctx: Ctx): View {
 
   // ---- line breakpoints (gutter) ---------------------------------------------------------
   const dots = new Map<number, HTMLElement>();
+  const rowLine = new WeakMap<HTMLElement, ListLine>();
   const paintDots = () => {
     const mine = ctx.data().lineBps.filter((b) => cur && b.func === cur.index);
     for (const [off, dot] of dots) {
@@ -201,7 +224,9 @@ export function codeView(ctx: Ctx): View {
       editBtn, validateBtn, saveBtn, cancelBtn,
       iconBtn("●", "breakpoint on entry", async () => { if (!cur) return; try { await rpc("fbp.set", { index: cur.index }); toast("breakpoint set — see Debugger", "ok"); } catch (e) { toast(errMsg(e), "error"); } }),
       iconBtn("✎", "rename", async () => { if (!cur) return; const n = await promptText("Rename", "Function name", cur.name); if (n === null) return; await rpc("mod.rename", { index: cur.index, name: n }); const dd = ctx.data(); if (n) dd.names[cur.index] = n; else delete dd.names[cur.index]; await ctx.saveData(); void open(cur.index, undefined, false); }),
-      iconBtn("⎘", "copy disassembly", () => cur && void copyText(cur.text)), iconBtn("⛁", "copy body hex", async () => { if (!cur) return; const r = await rpc("mod.funcHex", { index: cur.index }); void copyText(r.hex); }),
+      iconBtn("⎘", "copy disassembly as assembler text (with hints as ;; comments; can be pasted back into the editor)", () => cur && void copyText(cur.text)),
+      h("button", { title: "copy the code exactly as shown: one line per instruction — offset, bytes, instruction, hint — aligned", onclick: () => copyShown() }, "Copy code"),
+      h("label", { class: "chk", title: "include the bytes column in \"Copy code\"" }, withBytes, "bytes"), iconBtn("⛁", "copy body hex", async () => { if (!cur) return; const r = await rpc("mod.funcHex", { index: cur.index }); void copyText(r.hex); }),
       h("button", { onclick: () => void managePatches() }, "Patches…")),
     msg,
     h("div", { class: "cols", style: { flex: "1 1 55%" } }, h("div", { class: "fill" }, listing, editor), h("div", { class: "stack", style: { width: "260px", flex: "none" } }, h("div", { class: "panel", style: { overflow: "auto" } }, callers), h("div", { class: "panel", style: { overflow: "auto" } }, callees))),

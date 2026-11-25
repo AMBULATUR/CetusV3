@@ -140,3 +140,65 @@ describe("shared-memory watch table", () => {
     expect(last.func).toBe(storeFn);
   });
 });
+
+import { disassembleBody } from "../src/wasm/text";
+
+describe("line breakpoints inside Web Workers (worker-safe build)", () => {
+  const WAT = `(module
+    (import "env" "memory" (memory 1 1 shared))
+    (func (export "readHp") (param i32) (result f64)
+      local.get 0
+      i32.load offset=216
+      f32.load offset=140
+      f64.promote_f32)
+    (func (export "poke") (param i32 i32) local.get 0 local.get 1 i32.store offset=4))`;
+
+  it("a breakpoint on `f32.load offset=140` fires in the worker, with ea (offset included), value, exact count, cond-ready data", async () => {
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+    const m = parseModule(compile(WAT));
+    const offOf = (fi: number, name: string) => { const b = m.bodies[fi]!; return disassembleBody(m.bytes, b.start, b.end).lines.find((l) => l.name === name)!.off; };
+    const bps = [{ func: 0, off: offOf(0, "f32.load"), enabled: true }, { func: 1, off: offOf(1, "i32.store"), enabled: false }];
+    const rr = rewriteModule(m, { instrument: noCfg, bps, shared: { ctrl: CTRL.DEFAULT_ADDR, ring: true } });
+    expect(rr.K).toBe(0);
+    expect(rr.bp.reqs.length).toBe(2);
+    expect(WebAssembly.Module.imports(new WebAssembly.Module(rr.bytes as BufferSource)).map((i) => i.module)).toEqual(["env"]);
+
+    // object at 0x3000 holds a pointer (at +216) to a struct at 0x5000 whose float at +140 is 321.5
+    const dv = new DataView(memory.buffer);
+    dv.setUint32(0x3000 + 216, 0x5000, true);
+    dv.setFloat32(0x5000 + 140, 321.5, true);
+    const wm = new WatchMem(memory, CTRL.DEFAULT_ADDR);
+    wm.init();
+    wm.setBpEnabled(0, true);
+    wm.setBpEnabled(1, false);
+
+    const code = `
+      const { parentPort, workerData: d } = require("node:worker_threads");
+      WebAssembly.instantiate(d.mod, { env: { memory: d.memory } }).then(({ exports: e }) => {
+        const r = [];
+        for (let i = 0; i < 5; i++) r.push(e.readHp(0x3000));
+        e.poke(0x6000, 1);               // site 1 is disabled: must not report
+        parentPort.postMessage(r);
+      });`;
+    const res = await new Promise<number[]>((resolve, reject) => {
+      const w = new Worker(code, { eval: true, workerData: { mod: new WebAssembly.Module(rr.bytes as BufferSource), memory } });
+      w.on("message", resolve); w.on("error", reject);
+    });
+    expect(res).toEqual([321.5, 321.5, 321.5, 321.5, 321.5]); // semantics unchanged
+
+    expect(wm.bpCount(0)).toBe(5);   // exact, even though the ring only keeps 16 entries
+    expect(wm.bpCount(1)).toBe(0);   // disabled in shared memory
+    const hits = wm.drain().filter((h) => h.kind === 3);
+    expect(hits.length).toBe(5);
+    for (const h of hits) {
+      expect(h.slot).toBe(0);
+      expect(h.ea).toBe(0x5000 + 140);                       // effective address = base + offset=140
+      expect(h.func).toBe(0);
+      expect(h.off).toBe(bps[0]!.off);
+      const f = new DataView(new ArrayBuffer(4)); f.setUint32(0, Number(h.bits! & 0xffffffffn), true);
+      expect(f.getFloat32(0, true)).toBe(321.5);             // the loaded value
+    }
+    wm.clearBpCounts();
+    expect(wm.bpCount(0)).toBe(0);
+  });
+});
