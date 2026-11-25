@@ -3,6 +3,7 @@ import { rpc } from "../api";
 import { poller } from "../poll";
 import { Ctx, View } from "../ctx";
 import { fromHex, hex as hexStr } from "../../wasm/leb";
+import { dissectPane } from "./dissect";
 import { TYPE_INFO, ValType, readVal, writeVal, parseVal, fmtVal, bytesToBits, VAL_TYPES, dec } from "../../shared/codec";
 
 function evalAddr(s: string): number {
@@ -40,6 +41,7 @@ export function memoryView(ctx: Ctx): View {
   const tableHost = h("div", { class: "fill" });
   const tabHex = h("button", { class: "active" }, "Hex view");
   const tabTbl = h("button", null, "Table view");
+  const tabDis = h("button", { title: "Cheat-Engine style structure dissector: expandable pointers, type guessing, live compare, export" }, "Struct dissect");
   const hexPane = h("div", { class: "cols" });
   const tblPane = h("div", { class: "fill", style: { display: "none" } });
 
@@ -221,6 +223,7 @@ export function memoryView(ctx: Ctx): View {
     h("div", { class: "row", style: { marginTop: "6px" } }, watchSize, h("button", { onclick: () => void watch(2) }, "Find writes"), h("button", { onclick: () => void watch(1) }, "Find reads")),
     h("div", { class: "row", style: { marginTop: "6px" } },
       h("button", { onclick: async () => { try { const r = await rpc("mod.xrefs", { kind: "addr", value: selA, range: 0 }); if (!r.refs.length) toast("No code loads this constant", "info"); else ctx.go("functions", { filterFuncs: r.refs.map((x: any) => x.index), label: `functions referencing ${hex(selA)}` }); } catch (e) { toast(errMsg(e), "error"); } } }, "Code refs"),
+      h("button", { title: "open the structure dissector on this address", onclick: () => { dis.open(selA); setTab("dis"); } }, "Dissect"),
       h("button", { onclick: () => void copyText(hex(selA)) }, "Copy addr"),
       h("button", { onclick: () => { const [a, b] = sel(); void copyText(Array.from(bytes.slice(a - base, b - base + 1)).map(hexByte).join(" ")); } }, "Copy hex")));
   endian.addEventListener("change", () => { big = endian.checked; drawInspector(); });
@@ -256,12 +259,15 @@ export function memoryView(ctx: Ctx): View {
     void draw2();
   }
 
-  const setTab = (t: "hex" | "tbl") => {
-    tabHex.classList.toggle("active", t === "hex"); tabTbl.classList.toggle("active", t === "tbl");
+  const dis = dissectPane(ctx, (a) => { goto(a); setTab("hex"); });
+  const setTab = (t: "hex" | "tbl" | "dis") => {
+    tabHex.classList.toggle("active", t === "hex"); tabTbl.classList.toggle("active", t === "tbl"); tabDis.classList.toggle("active", t === "dis");
     hexPane.style.display = t === "hex" ? "" : "none"; tblPane.style.display = t === "tbl" ? "flex" : "none";
+    dis.el.style.display = t === "dis" ? "flex" : "none";
+    if (t === "dis") dis.onShow(); else dis.onHide();
     if (t === "tbl") buildTable();
   };
-  tabHex.onclick = () => setTab("hex"); tabTbl.onclick = () => setTab("tbl");
+  tabHex.onclick = () => setTab("hex"); tabTbl.onclick = () => setTab("tbl"); tabDis.onclick = () => setTab("dis");
 
   const go = () => { try { goto(evalAddr(addrIn.value)); } catch (e) { toast(errMsg(e), "error"); } };
   addrIn.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
@@ -269,12 +275,12 @@ export function memoryView(ctx: Ctx): View {
   hexPane.append(h("div", { class: "fill" }, grid), inspector2);
   tblPane.classList.add("stack");
 
-  const poll = poller("pollMemory", async () => { if (auto.checked && tblPane.style.display === "none") await refresh(false); });
+  const poll = poller("pollMemory", async () => { if (dis.isActive()) await dis.tick(); else if (auto.checked && tblPane.style.display === "none") await refresh(false); });
   const el = h("div", { class: "view" },
     h("div", { class: "row" }, addrIn, h("button", { onclick: go }, "Go"),
       iconBtn("◀", "previous page (PgUp)", () => goto(base - viewSize, false)), iconBtn("▶", "next page (PgDn)", () => goto(base + viewSize, false)),
       sizeSel, colSel, h("label", { class: "chk" }, auto, "auto-refresh"), h("button", { onclick: () => void refresh(true) }, "↻"), memInfo),
-    h("div", { class: "tabs" }, tabHex, tabTbl), hexPane, tblPane);
+    h("div", { class: "tabs" }, tabHex, tabTbl, tabDis), hexPane, tblPane, dis.el);
 
   return {
     el,
@@ -283,6 +289,6 @@ export function memoryView(ctx: Ctx): View {
       poll.start();
     },
     hide() { poll.stop(); },
-    retarget() { bytes = new Uint8Array(0); clear(grid); },
+    retarget() { bytes = new Uint8Array(0); clear(grid); dis.reset(); },
   };
 }

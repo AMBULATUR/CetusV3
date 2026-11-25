@@ -269,6 +269,53 @@ export class CetusInstance {
     if (addr >= b.byteLength) return { hex: "", memBytes: b.byteLength };
     return { hex: hex(new Uint8Array(b, addr, Math.min(len, b.byteLength - addr))), memBytes: b.byteLength };
   }
+  private vtSpan: { lo: number; hi: number } | null | undefined;
+  /** span of the module's static data (where vtables / .rodata live); null when unknown */
+  private vtableSpan(): { lo: number; hi: number } | null {
+    if (this.vtSpan !== undefined) return this.vtSpan;
+    let r: { lo: number; hi: number } | null = null;
+    const m = this.rec.model;
+    if (m) {
+      const L = findStaticLayout(m);
+      const rs = L.ranges.filter((x) => x.hi > x.lo);
+      if (rs.length) r = { lo: Math.min(...rs.map((x) => x.lo)), hi: Math.max(L.end, ...rs.map((x) => x.hi)) };
+    }
+    return (this.vtSpan = r);
+  }
+  /**
+   * Struct dissector: ONE round trip reads many blocks, at any pointer depth. An item is a start address plus the
+   * offsets of the pointer fields to follow (`steps`); the block is read where the last pointer leads.
+   * With `probe`, every 4-byte aligned word that looks like a heap pointer also returns the word it points at
+   * (`vt[i]` for word i), so the UI can tag `[vtable]` pointers.
+   */
+  op_dissect_read(a: { items: { addr: number; steps?: number[]; len: number; probe?: boolean }[] }) {
+    const b = this.buf();
+    const n = b.byteLength;
+    const dv = new DataView(b);
+    const items = a.items.slice(0, 512).map((it) => {
+      let cur = it.addr >>> 0;
+      let ok = cur < n;
+      for (const st of it.steps ?? []) {
+        if (!ok) break;
+        const p = cur + st;
+        if (p < 0 || p + 4 > n) { ok = false; break; }
+        cur = dv.getUint32(p, true);
+        if (cur < 0x1000 || cur >= n) ok = false;
+      }
+      const len = Math.max(0, Math.min(it.len | 0, 8192, n - cur));
+      if (!ok || len <= 0) return { a: -1, hex: "", vt: null as (number | null)[] | null };
+      let vt: (number | null)[] | null = null;
+      if (it.probe) {
+        vt = [];
+        for (let o = 0; o + 4 <= len; o += 4) {
+          const w = dv.getUint32(cur + o, true);
+          vt.push(w >= 0x1000 && w + 4 <= n && (w & 3) === 0 ? dv.getUint32(w, true) : null);
+        }
+      }
+      return { a: cur, hex: hex(new Uint8Array(b, cur, len)), vt };
+    });
+    return { memBytes: n, items, vtRange: this.vtableSpan() };
+  }
   op_readValues(a: { items: { addr: number; type: ValType }[] }) {
     const dv = this.dv();
     return a.items.map((it) => {

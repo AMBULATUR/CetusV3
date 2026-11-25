@@ -160,13 +160,15 @@ export interface Bookmark {
   ptrParams?: { maxOff: number; levels: number; staticLo: number; staticHi: number; maxFrontier: number; maxResults: number; requireVtable?: boolean; useGlobals?: boolean };
 }
 export interface LineBp { func: number; off: number; enabled: boolean; cond?: string; pause?: boolean; text?: string }
-export interface PageData { bookmarks: Bookmark[]; names: Record<string, string>; breakpoints: number[]; baseline?: number[] | undefined; lineBps: LineBp[] }
+/** the Struct Dissect session: roots, expanded pointers and the fields the user renamed / retyped */
+export interface DissectSaved { exprs: string[]; size: number; expanded: string[]; fields: Record<string, { off: number; type: string; size: number; name: string; desc: string; user: boolean }[]> }
+export interface PageData { bookmarks: Bookmark[]; names: Record<string, string>; breakpoints: number[]; baseline?: number[] | undefined; lineBps: LineBp[]; dissect?: DissectSaved | undefined }
 
 const DATA_KEY = "cetusPageData";
 export async function loadPageData(key = pageKey()): Promise<PageData> {
   const all = ((await chrome.storage.local.get(DATA_KEY))[DATA_KEY] ?? {}) as Record<string, PageData>;
   const d = (all[key] ?? { bookmarks: [], names: {}, breakpoints: [], lineBps: [] }) as Partial<PageData>;
-  return { bookmarks: d.bookmarks ?? [], names: d.names ?? {}, breakpoints: d.breakpoints ?? [], baseline: d.baseline, lineBps: d.lineBps ?? [] };
+  return { bookmarks: d.bookmarks ?? [], names: d.names ?? {}, breakpoints: d.breakpoints ?? [], baseline: d.baseline, lineBps: d.lineBps ?? [], dissect: d.dissect };
 }
 export async function savePageData(d: PageData, key = pageKey()): Promise<void> {
   const all = ((await chrome.storage.local.get(DATA_KEY))[DATA_KEY] ?? {}) as Record<string, PageData>;

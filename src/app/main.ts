@@ -31,6 +31,16 @@ const ctx: Ctx = {
     toast(`Added 0x${addr.toString(16)} to cheat table`, "ok", 1400);
     if (currentView === "cheat") views.get("cheat")?.show?.();
   },
+  async addPathBookmark(chain, type = "i32", desc = "", len) {
+    const key = (c: { base: number; offsets: number[]; global?: number }) => `${c.global !== undefined ? "g" + c.global : c.base}:${c.offsets.join(",")}`;
+    if (data.bookmarks.some((b) => b.ptr && key(b.ptr) === key(chain) && b.type === type)) return toast("already in the cheat table", "info", 1500);
+    const b: Bookmark = { id: Math.random().toString(36).slice(2), addr: 0, type, desc, freeze: false, freezeMode: "hard", ptr: { base: chain.base, offsets: [...chain.offsets], ...(chain.global !== undefined ? { global: chain.global } : {}) } };
+    if (len) b.len = len;
+    data.bookmarks.push(b);
+    await ctx.saveData();
+    toast("Added pointer path to cheat table", "ok", 1600);
+    if (currentView === "cheat") views.get("cheat")?.show?.();
+  },
   data: () => data,
   saveData: () => savePageData(data, pageKey(getCurrent())),
   target: () => getCurrent(),
