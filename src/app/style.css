@@ -112,3 +112,18 @@ pre.stack { margin: 0; font-family: var(--mono); font-size: 12px; white-space: p
 .dis input.nm { width: 100%; background: transparent; border: 1px solid transparent; color: inherit; font: inherit; padding: 1px 3px; }
 .dis input.nm:hover, .dis input.nm:focus { border-color: var(--line); }
 .dis tr.invalid td { color: var(--muted); font-style: italic; }
+
+/* decompiler */
+.dc .dl { white-space: pre; line-height: 1.5; padding-right: 10px; font-size: 12px; }
+.dc .dl.lsel { background: var(--sel); }
+.dc .dl.comment, .dc .dl.comment span { color: var(--muted); }
+.dc .dl.bb { color: #e0a45a; margin-top: 4px; }
+.dc .kw { color: #e0a45a; } .dc .ty { color: #b58be0; } .dc .num { color: #6fa8d6; } .dc .str { color: #6f9d6f; }
+.dc .cm { color: #6f7785; } .dc .cm.user { color: #6f9d6f; font-style: italic; } .dc .cm.warn { color: var(--warn); }
+.dc .fn { color: var(--accent); } .dc .fn.unresolved { color: #8a919e; } .dc .var { color: #d7dae0; } .dc .opaque { color: #b58be0; }
+.dc .off { color: var(--muted); } .dc .const-named { color: #d6a8e0; }
+.dc .ref { cursor: pointer; } .dc .ref:hover { text-decoration: underline; }
+.dc .sym-inferred { text-decoration: underline dashed; text-underline-offset: 3px; }
+.dc [data-off].osel { background: #35b9d655; outline: 1px solid var(--accent); border-radius: 2px; }
+.dc [data-off] { cursor: pointer; }
+.lrow.hl2 { background: var(--sel); }

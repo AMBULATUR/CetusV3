@@ -6,6 +6,7 @@ import { ValType, TYPE_INFO, isValType, readVal, writeVal, parseVal, enc, Val, f
 import { MatchSpec, compileMatcher } from "../shared/matcher";
 import { hex, fromHex } from "../wasm/leb";
 import { funcDisplayName, funcTypeString, SECTION_NAMES, ModuleModel } from "../wasm/module";
+import { buildIR } from "../decomp/build";
 import { disassembleBody } from "../wasm/text";
 import { mapFunctionOffsets } from "../wasm/rewrite";
 import { SpeedHack } from "./speedhack";
@@ -289,6 +290,16 @@ export class CetusInstance {
    * With `probe`, every 4-byte aligned word that looks like a heap pointer also returns the word it points at
    * (`vt[i]` for word i), so the UI can tag `[vtable]` pointers.
    */
+  /**
+   * Decompiler front half: function body -> IR (plain JSON). Names are the MODULE'S OWN (name section / export / import /
+   * func_N), never the user's: the app layers its annotation database on top so confirmed and inferred stay distinguishable.
+   */
+  op_decomp_ir(a: { index: number }) {
+    const m = this.rec.model;
+    if (!m) throw new Error("module is not parsed");
+    const ir = buildIR(m, a.index, { funcName: (i) => funcDisplayName(m, i), cstring: (v) => this.cstringAt(v) ?? undefined });
+    return { ir, moduleId: this.rec.moduleId(), memBytes: this.memory ? this.buf().byteLength : 0 };
+  }
   op_dissect_read(a: { items: { addr: number; steps?: number[]; len: number; probe?: boolean }[] }) {
     const b = this.buf();
     const n = b.byteLength;
@@ -714,6 +725,13 @@ export class CetusInstance {
   op_script_run(a: RunRequest) { return this.scripts.start(this, a); }
   op_script_stop(a: { id: string }) { return this.scripts.stop(a.id); }
   op_script_status(a: { id: string }) { return this.scripts.status(a.id); }
+  /** the `global.x` values (Scripts view: inspect / edit / delete) */
+  op_script_globals() { return Object.fromEntries(this.scripts.globals); }
+  op_script_setGlobal(a: { name: string; value?: number | string | boolean | null; delete?: boolean }) {
+    if (a.delete) return this.scripts.globals.delete(a.name);
+    this.scripts.globals.set(a.name, a.value ?? null);
+    return true;
+  }
   op_script_list() { return [...this.scripts.runs.values()].map((r) => ({ id: r.id, name: r.name, running: r.running })); }
 
   // ---- line breakpoints --------------------------------------------------------------

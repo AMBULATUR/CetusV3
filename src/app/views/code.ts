@@ -1,6 +1,7 @@
 import { h, hex, toast, errMsg, link, iconBtn, promptText, copyText, modal, field, download, clear } from "../ui";
 import { rpc, loadPatches, savePatches, pageKey, reloadTarget, SavedPatch } from "../api";
 import { lineBpPanel } from "./linebp";
+import { decompPane } from "./decompile";
 import { Ctx, View } from "../ctx";
 import { assemble } from "../../wasm/text";
 import { formatListing, ListLine } from "../../shared/listing";
@@ -41,6 +42,28 @@ export function codeView(ctx: Ctx): View {
     e.preventDefault();
     e.clipboardData?.setData("text/plain", formatListing(picked, { bytes: withBytes.checked }));
   });
+  /** highlight the disassembly row of an instruction (selection coming from the pseudocode / IR, or a click here) */
+  const markRow = (off: number | null, scroll = false) => {
+    listing.querySelectorAll(".lrow.hl2").forEach((r) => r.classList.remove("hl2"));
+    if (off === null) return;
+    const r = listing.querySelector<HTMLElement>(`.lrow[data-off="${off}"]`);
+    if (r) { r.classList.add("hl2"); if (scroll) r.scrollIntoView({ block: "center" }); }
+  };
+  const dc = decompPane(ctx, {
+    onSelect: (off) => markRow(off, true),
+    reopen: (f) => void open(f),
+    refreshListing: () => { if (cur) void open(cur.index, undefined, false); },
+    onRender: () => { /* the annotation database may have changed: refresh instruction comments of the listing */
+      listing.querySelectorAll<HTMLElement>(".lrow[data-off]").forEach((r) => {
+        r.querySelector(".cmt.user")?.remove();
+        const t = dc.insComment(Number(r.dataset.off));
+        if (t) r.appendChild(h("span", { class: "cmt user", title: "your comment" }, "// " + t));
+      });
+    },
+  });
+  let decompOn = false;
+  const decompBtn = h("button", { title: "pseudocode, IR and symbol table of this function, synchronized with the disassembly" }, "Decompile");
+  decompBtn.onclick = () => { decompOn = !decompOn; decompBtn.classList.toggle("active", decompOn); dc.el.style.display = decompOn ? "flex" : "none"; if (decompOn && cur && !cur.imported) void dc.load(cur.index, true); };
   const editor = h("textarea", { class: "editor", spellcheck: false, style: { display: "none" } });
   const callers = h("div", { class: "scroll", style: { maxHeight: "40%" } });
   const callees = h("div", { class: "scroll", style: { maxHeight: "40%" } });
@@ -58,6 +81,7 @@ export function codeView(ctx: Ctx): View {
       setEdit(false);
       render(off);
       void loadXrefs(idx);
+      void dc.load(idx); // also loads the project annotations, so instruction comments show up in the listing
     } catch (e) { toast(errMsg(e), "error"); }
   }
 
@@ -83,6 +107,9 @@ export function codeView(ctx: Ctx): View {
         dot, h("span", { class: "off" }, "+" + l.off.toString(16).padStart(4, "0")), h("span", { class: "byt", title: l.bytes }, l.bytes), insEl,
         l.target !== undefined ? h("span", { class: "cmt" }, "→ ", link(l.comment || `func ${l.target}`, () => void open(l.target!), `go to function ${l.target}`)) : l.comment ? h("span", { class: "cmt" }, l.comment) : "");
       rowLine.set(row, l);
+      const uc = dc.insComment(l.off);
+      if (uc) row.appendChild(h("span", { class: "cmt user", title: "your comment" }, "// " + uc));
+      row.addEventListener("click", () => { markRow(l.off); dc.select(l.off, "dis"); });
       row.addEventListener("dblclick", () => { const m = /i32\.const (-?\d+)/.exec(l.text); if (m) ctx.openMemory(Number(m[1]) >>> 0); });
       if (hl === l.off) hlEl = row;
       frag.appendChild(row);
@@ -221,15 +248,15 @@ export function codeView(ctx: Ctx): View {
   const nav = (d: number) => { const n = hpos + d; if (n >= 0 && n < history.length) { hpos = n; void open(history[n]!, undefined, false); } };
   const el = h("div", { class: "view" },
     h("div", { class: "row" }, iconBtn("◀", "back", () => nav(-1)), iconBtn("▶", "forward", () => nav(1)), input, h("button", { onclick: () => void resolve() }, "Go"), title,
-      editBtn, validateBtn, saveBtn, cancelBtn,
+      decompBtn, editBtn, validateBtn, saveBtn, cancelBtn,
       iconBtn("●", "breakpoint on entry", async () => { if (!cur) return; try { await rpc("fbp.set", { index: cur.index }); toast("breakpoint set — see Debugger", "ok"); } catch (e) { toast(errMsg(e), "error"); } }),
-      iconBtn("✎", "rename", async () => { if (!cur) return; const n = await promptText("Rename", "Function name", cur.name); if (n === null) return; await rpc("mod.rename", { index: cur.index, name: n }); const dd = ctx.data(); if (n) dd.names[cur.index] = n; else delete dd.names[cur.index]; await ctx.saveData(); void open(cur.index, undefined, false); }),
+      iconBtn("✎", "rename", async () => { if (!cur) return; const n = await promptText("Rename", "Function name", cur.name); if (n === null) return; await rpc("mod.rename", { index: cur.index, name: n }); const dd = ctx.data(); if (n) dd.names[cur.index] = n; else delete dd.names[cur.index]; await ctx.saveData(); await dc.renameFunc(cur.index, n); void open(cur.index, undefined, false); }),
       iconBtn("⎘", "copy disassembly as assembler text (with hints as ;; comments; can be pasted back into the editor)", () => cur && void copyText(cur.text)),
       h("button", { title: "copy the code exactly as shown: one line per instruction — offset, bytes, instruction, hint — aligned", onclick: () => copyShown() }, "Copy code"),
       h("label", { class: "chk", title: "include the bytes column in \"Copy code\"" }, withBytes, "bytes"), iconBtn("⛁", "copy body hex", async () => { if (!cur) return; const r = await rpc("mod.funcHex", { index: cur.index }); void copyText(r.hex); }),
       h("button", { onclick: () => void managePatches() }, "Patches…")),
     msg,
-    h("div", { class: "cols", style: { flex: "1 1 55%" } }, h("div", { class: "fill" }, listing, editor), h("div", { class: "stack", style: { width: "260px", flex: "none" } }, h("div", { class: "panel", style: { overflow: "auto" } }, callers), h("div", { class: "panel", style: { overflow: "auto" } }, callees))),
+    h("div", { class: "cols", style: { flex: "1 1 55%" } }, h("div", { class: "fill" }, listing, editor), dc.el, h("div", { class: "stack", style: { width: "260px", flex: "none" } }, h("div", { class: "panel", style: { overflow: "auto" } }, callers), h("div", { class: "panel", style: { overflow: "auto" } }, callees))),
     h("div", { class: "panel fill", style: { flex: "1 1 45%", minHeight: "190px" } }, h("h3", null, "Line breakpoints of this function"), bpPanel.el));
   void field; void hex;
 
@@ -237,6 +264,6 @@ export function codeView(ctx: Ctx): View {
     el,
     show(p) { bpPanel.start(); if (p?.func !== undefined) void open(p.func, p.off); else if (reopen !== undefined && !cur) { const f = reopen; reopen = undefined; void open(f); } else if (!cur) listing.appendChild(h("div", { class: "empty" }, "Pick a function from the Functions view or type an index / name above.")); },
     hide() { bpPanel.stop(); },
-    retarget() { if (cur) reopen = cur.index; cur = null; history = []; hpos = -1; clear(listing); title.textContent = ""; setEdit(false); },
+    retarget() { dc.clear(); if (cur) reopen = cur.index; cur = null; history = []; hpos = -1; clear(listing); title.textContent = ""; setEdit(false); },
   };
 }

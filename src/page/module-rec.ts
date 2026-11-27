@@ -1,4 +1,5 @@
 import { ModuleModel, parseModule } from "../wasm/module";
+import { moduleIdentity } from "../decomp/annotations";
 import { rewriteModule, RewriteResult, FunctionPatch, InstrumentConfig, BpRequest, CTRL } from "../wasm/rewrite";
 import { fromHex, fromBase64 } from "../wasm/leb";
 import { Analysis, analyze } from "../wasm/analysis";
@@ -148,6 +149,10 @@ export class ModuleRec {
     if (!this._analysis) this._analysis = analyze(this.model!);
     return this._analysis;
   }
+
+  private _id: string | null = null;
+  /** identity of the ORIGINAL module bytes (annotations are keyed by it; instrumentation never changes it) */
+  moduleId(): string { return (this._id ??= moduleIdentity(this.orig)); }
 
   get K(): number { return this.rr?.K ?? 0; }
 

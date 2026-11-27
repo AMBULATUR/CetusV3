@@ -38,7 +38,7 @@ export function buildRows(rows: ScriptRowIn[]): Map<string, RowDef> {
   return map;
 }
 
-export function createEnv(inst: CetusInstance, rows: Map<string, RowDef>, st: { logs: string[] }, silent: boolean): ScriptEnv {
+export function createEnv(inst: CetusInstance, rows: Map<string, RowDef>, st: { logs: string[] }, silent: boolean, globals: Map<string, any> = new Map()): ScriptEnv {
   const buf = () => inst.buf();
   const isText = (t: string) => t === "str8" || t === "str16";
   const addrOf = (r: RowDef): number => {
@@ -60,7 +60,7 @@ export function createEnv(inst: CetusInstance, rows: Map<string, RowDef>, st: { 
     return TYPE_INFO[t].big ? BigInt(Math.trunc(v)) : Math.trunc(v);
   };
   const env: ScriptEnv = {
-    rows, addrOf,
+    rows, addrOf, globals,
     readRow(r) {
       const a = addrOf(r);
       if (isText(r.type)) return readCString(buf(), a, r.type === "str16" ? "utf16" : "utf8", r.len ?? 256);
@@ -109,6 +109,8 @@ export function createEnv(inst: CetusInstance, rows: Map<string, RowDef>, st: { 
 /** Per-instance registry of running scripts. Running a script that is already running stops it (toggle). */
 export class ScriptManager {
   runs = new Map<string, RunState>();
+  /** `global.x` values: shared by all scripts of this page, kept across runs until the page reloads */
+  globals = new Map<string, any>();
 
   start(inst: CetusInstance, req: RunRequest): { started: boolean; stopped?: boolean } {
     const old = this.runs.get(req.id);
@@ -120,7 +122,7 @@ export class ScriptManager {
     }
     const rows = buildRows(req.rows);
     const st: RunState = { id: req.id, name: req.name ?? req.id, running: true, error: null, logs: [], started: Date.now(), ended: null, run: undefined as unknown as ScriptRun };
-    const env = createEnv(inst, rows, st, !!req.silent);
+    const env = createEnv(inst, rows, st, !!req.silent, this.globals);
     st.run = new ScriptRun(env);
     this.runs.set(req.id, st);
     // syntax errors are reported synchronously

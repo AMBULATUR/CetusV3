@@ -177,6 +177,15 @@ export async function savePageData(d: PageData, key = pageKey()): Promise<void> 
 }
 
 export interface SavedPatch { name: string; url: string; enabled: boolean; created: number; functionPatches: { index: number; code: string; locals?: string; note?: string }[] }
+/** annotation database of one module (project-level: shared by every page / reload that loads the same module bytes) */
+export async function loadAnnotations(moduleId: string): Promise<unknown | null> {
+  const k = `ann:${moduleId}`;
+  return ((await chrome.storage.local.get(k))[k] ?? null) as unknown | null;
+}
+export async function saveAnnotations(db: { moduleId: string }): Promise<void> {
+  await chrome.storage.local.set({ [`ann:${db.moduleId}`]: db });
+}
+
 export async function loadPatches(): Promise<SavedPatch[]> {
   return ((await chrome.storage.local.get("savedPatches")).savedPatches ?? []) as SavedPatch[];
 }

@@ -129,3 +129,50 @@ describe("script language", () => {
     expect(rowIdentifier("log")).toBe("log_");
   });
 });
+
+describe("global / temp values", () => {
+  const mkEnv = (globals?: Map<string, any>) => {
+    const logs: string[] = [];
+    const env: any = { rows: new Map(), addrOf: () => 0, readRow: () => 0, writeRow() {}, readAt: () => 0, writeAt() {}, readStr: () => "", writeStr() {}, freeze() {}, unfreeze() {}, isFrozen: () => false, log: (m: string) => logs.push(m), notify() {}, call: () => 0, ...(globals ? { globals } : {}) };
+    return { env, logs };
+  };
+  it("global.x persists across runs and is shared; temp.x lives for one run", async () => {
+    const g = new Map<string, any>();
+    const a = mkEnv(g);
+    await new ScriptRun(a.env).run("global.kills = 3; global.kills += 2; global.kills++; temp.t = 10; log(global.kills, temp.t)");
+    expect(a.logs).toEqual(["6 10"]);
+    expect(g.get("kills")).toBe(6);
+    const b = mkEnv(g);                                   // a second script on the same page
+    await new ScriptRun(b.env).run("log(global.kills, temp.t, getGlobal('nope', 'dflt'), hasGlobal('kills'))");
+    expect(b.logs).toEqual(["6 undefined dflt true"]);    // temp is gone, global is still there
+  });
+  it("setGlobal / getGlobal / delGlobal / setTemp builtins, compound ops and text values", async () => {
+    const e = mkEnv(new Map());
+    await new ScriptRun(e.env).run(`setGlobal("name", "Bob"); global.hp = 10; global.hp *= 3; setTemp("k", 7); log(getGlobal("name"), global.hp, getTemp("k")); delGlobal("name"); log(hasGlobal("name"))`);
+    expect(e.logs).toEqual(["Bob 30 7", "false"]);
+  });
+  it("only scalar values can be stored and a row named global does not clash", async () => {
+    const e = mkEnv(new Map());
+    await expect(new ScriptRun(e.env).run("global.x = row('a')")).rejects.toThrow();
+    expect(rowIdentifier("global")).toBe("global_");
+    expect(rowIdentifier("temp")).toBe("temp_");
+  });
+});
+
+import { readFileSync } from "node:fs";
+import { SCRIPT_DOCS } from "../src/shared/scriptdocs";
+import { BUILTIN_NAMES } from "../src/page/script";
+
+describe("scripting documentation", () => {
+  const md = readFileSync(new URL("../docs/SCRIPTING.md", import.meta.url), "utf8");
+  it("the in-app copy equals docs/SCRIPTING.md", () => { expect(SCRIPT_DOCS).toBe(md); });
+  it("every builtin function is documented", () => {
+    for (const n of BUILTIN_NAMES) expect(md, n).toContain(n);
+  });
+  it("the documented global/temp examples actually run", async () => {
+    const g = new Map<string, any>(); const logs: string[] = [];
+    const env: any = { rows: new Map(), addrOf: () => 0, readRow: () => 0, writeRow() {}, readAt: () => 0, writeAt() {}, readStr: () => "", writeStr() {}, freeze() {}, unfreeze() {}, isFrozen: () => false, log: (m: string) => logs.push(m), notify() {}, call: () => 0, globals: g };
+    await new ScriptRun(env).run(`global.runs = getGlobal("runs", 0) + 1\nlog("run #", global.runs)\ntemp.i = 0\nwhile (temp.i < 3) { temp.i++ }\nlog("tries", temp.i)\nglobal.god = !global.god\nlog(global.god)`);
+    expect(logs).toEqual(["run # 1", "tries 3", "true"]);
+  });
+});

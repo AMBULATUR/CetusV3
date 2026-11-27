@@ -29,7 +29,13 @@ export interface ScriptEnv {
   log(msg: string): void;
   notify(msg: string, kind?: "info" | "ok" | "error"): void;
   call(name: string, args: any[]): any;
+  /** values shared by every script on the page (`global.x`); survive script restarts until the page reloads */
+  globals?: Map<string, ScriptValue>;
 }
+
+/** what `global.x` / `temp.x` can hold */
+export type ScriptValue = number | string | boolean | null | undefined;
+const isScalar = (v: any): v is ScriptValue => v === null || v === undefined || ["number", "string", "boolean"].includes(typeof v);
 
 export class ScriptError extends Error {
   constructor(msg: string, readonly line?: number) { super(line ? `line ${line}: ${msg}` : msg); }
@@ -97,8 +103,8 @@ type Expr =
   | { t: "lit"; v: any } | { t: "id"; name: string; line: number }
   | { t: "un"; op: string; e: Expr } | { t: "bin"; op: string; l: Expr; r: Expr }
   | { t: "log"; op: string; l: Expr; r: Expr } | { t: "cond"; c: Expr; a: Expr; b: Expr }
-  | { t: "assign"; op: string; name: string; e: Expr; line: number }
-  | { t: "upd"; op: string; prefix: boolean; name: string; line: number }
+  | { t: "assign"; op: string; name: string; scope?: "global" | "temp"; e: Expr; line: number }
+  | { t: "upd"; op: string; prefix: boolean; name: string; scope?: "global" | "temp"; line: number }
   | { t: "call"; name: string; args: Expr[]; line: number } | { t: "member"; obj: Expr; prop: string; line: number };
 type Stmt =
   | { t: "expr"; e: Expr } | { t: "let"; name: string; e: Expr | null }
@@ -106,6 +112,7 @@ type Stmt =
   | { t: "for"; init: Stmt | null; c: Expr | null; step: Expr | null; body: Stmt }
   | { t: "block"; body: Stmt[] } | { t: "break" } | { t: "continue" } | { t: "return"; e: Expr | null };
 
+const SCOPES = ["global", "temp"];
 const KEYWORDS = new Set(["if", "else", "while", "for", "let", "var", "const", "break", "continue", "return", "true", "false", "null", "undefined"]);
 
 class Parser {
@@ -180,7 +187,11 @@ class Parser {
     const left = this.ternary();
     if (this.cur.k === "op" && ["=", "+=", "-=", "*=", "/=", "%=", "**="].includes(this.cur.v)) {
       const op = this.cur.v as string, tok = this.cur;
-      if (left.t !== "id") this.err("the left side of an assignment must be a row or variable name", tok);
+      if (left.t === "member" && left.obj.t === "id" && SCOPES.includes(left.obj.name)) {
+        this.p++;
+        return { t: "assign", op, name: left.prop, scope: left.obj.name as "global" | "temp", e: this.assignment(), line: tok.line };
+      }
+      if (left.t !== "id") this.err("the left side of an assignment must be a row, a variable, or global.name / temp.name", tok);
       this.p++;
       return { t: "assign", op, name: left.name, e: this.assignment(), line: tok.line };
     }
@@ -233,6 +244,9 @@ class Parser {
         this.p++;
         if (this.cur.k !== "id") this.err("expected a property name");
         e = { t: "member", obj: e, prop: this.cur.v as string, line: this.cur.line }; this.p++;
+      } else if ((this.isOp("++") || this.isOp("--")) && !this.cur.nl && e.t === "member" && e.obj.t === "id" && SCOPES.includes(e.obj.name)) {
+        const op = this.cur.v as string; this.p++;
+        e = { t: "upd", op, prefix: false, name: e.prop, scope: e.obj.name as "global" | "temp", line: this.cur.line };
       } else if ((this.isOp("++") || this.isOp("--")) && !this.cur.nl && e.t === "id") {
         const op = this.cur.v as string; this.p++;
         e = { t: "upd", op, prefix: false, name: e.name, line: this.cur.line };
@@ -309,6 +323,8 @@ type Sig = "break" | "continue" | "return" | null;
 
 export class ScriptRun {
   private scopes: Map<string, any>[] = [new Map()];
+  /** `temp.x`: script-wide scratch values, private to this run, gone when it ends */
+  readonly temps = new Map<string, ScriptValue>();
   private steps = 0;
   private lastYield = performance.now();
   private stopped = false;
@@ -317,7 +333,9 @@ export class ScriptRun {
   returned: any = undefined;
   readonly started = Date.now();
 
-  constructor(readonly env: ScriptEnv) {}
+  /** page-wide values; a standalone run (tests) gets its own */
+  readonly globals: Map<string, ScriptValue>;
+  constructor(readonly env: ScriptEnv) { this.globals = env.globals ?? new Map(); }
 
   stop(): void {
     this.stopped = true;
@@ -441,17 +459,29 @@ export class ScriptRun {
       case "cond": return this.truthy(await this.ev(e.c)) ? this.ev(e.a) : this.ev(e.b);
       case "assign": {
         let v = this.val(await this.ev(e.e));
+        if (e.scope) {
+          if (e.op !== "=") v = this.binop(e.op.slice(0, -1), this.scopeGet(e.scope, e.name), v);
+          this.scopeSet(e.scope, e.name, v, e.line);
+          return v;
+        }
         if (e.op !== "=") v = this.binop(e.op.slice(0, -1), this.val(await this.ev({ t: "id", name: e.name, line: e.line })), v);
         this.store(e.name, v, e.line);
         return v;
       }
       case "upd": {
+        if (e.scope) {
+          const o = Number(this.scopeGet(e.scope, e.name) ?? 0);
+          const n = e.op === "++" ? o + 1 : o - 1;
+          this.scopeSet(e.scope, e.name, n, e.line);
+          return e.prefix ? n : o;
+        }
         const old = Number(this.val(await this.ev({ t: "id", name: e.name, line: e.line })));
         const nv = e.op === "++" ? old + 1 : old - 1;
         this.store(e.name, nv, e.line);
         return e.prefix ? nv : old;
       }
       case "member": {
+        if (e.obj.t === "id" && SCOPES.includes(e.obj.name) && !this.lookup(e.obj.name) && !this.env.rows.has(e.obj.name)) return this.scopeGet(e.obj.name as "global" | "temp", e.prop);
         // `Health.addr` must see the row itself, not its current value
         const o = e.obj.t === "id" && !this.lookup(e.obj.name) && this.env.rows.has(e.obj.name) ? new RowRef(this.env.rows.get(e.obj.name)!) : await this.ev(e.obj);
         if (o instanceof RowRef) return this.prop(o, e.prop, e.line);
@@ -460,6 +490,18 @@ export class ScriptRun {
       }
       case "call": return this.call(e);
     }
+  }
+
+  private scopeMap(s: "global" | "temp"): Map<string, ScriptValue> { return s === "global" ? this.globals : this.temps; }
+  /** a name that was never assigned reads as undefined (like a JS object property), so `global.n = (global.n ?? 0) + 1` patterns work with `if`/`||` */
+  scopeGet(s: "global" | "temp", name: string): ScriptValue { return this.scopeMap(s).get(name); }
+  scopeSet(s: "global" | "temp", name: string, v: any, line?: number): void {
+    if (v instanceof RowRef) v = this.env.readRow(v.def);
+    if (typeof v === "bigint") v = Number(v);
+    if (!isScalar(v)) throw new ScriptError(`${s}.${name}: only numbers, text, true/false and null can be stored`, line);
+    const m = this.scopeMap(s);
+    if (!m.has(name) && m.size >= 1000) throw new ScriptError(`too many ${s} values (limit 1000)`, line);
+    m.set(name, v);
   }
 
   private store(name: string, v: any, line?: number): void {
@@ -561,6 +603,15 @@ const BUILTINS: Record<string, Builtin> = {
   max: { fn: (it, a) => Math.max(...a.map((x) => num(it["val"](x)))) },
   rand: { fn: (it, a) => { const lo = a.length > 1 ? num(it["val"](a[0])) : 0; const hi = a.length > 1 ? num(it["val"](a[1])) : a.length ? num(it["val"](a[0])) : 1; return a.length ? Math.floor(lo + Math.random() * (hi - lo + 1)) : Math.random(); } },
   now: { fn: () => Date.now() },
+  // values that outlive the run: shared by all scripts of the page until it reloads
+  setGlobal: { fn: (it, a) => { it.scopeSet("global", String(a[0]), it["val"](a[1])); } },
+  getGlobal: { fn: (it, a) => { const v = it.scopeGet("global", String(a[0])); return v === undefined && a.length > 1 ? it["val"](a[1]) : v; } },
+  hasGlobal: { fn: (it, a) => it.globals.has(String(a[0])) },
+  delGlobal: { fn: (it, a) => it.globals.delete(String(a[0])) },
+  clearGlobals: { fn: (it) => { it.globals.clear(); } },
+  // values private to this run
+  setTemp: { fn: (it, a) => { it.scopeSet("temp", String(a[0]), it["val"](a[1])); } },
+  getTemp: { fn: (it, a) => { const v = it.scopeGet("temp", String(a[0])); return v === undefined && a.length > 1 ? it["val"](a[1]) : v; } },
 };
 export const BUILTIN_NAMES = Object.keys(BUILTINS);
 
@@ -569,7 +620,7 @@ export function rowIdentifier(label: string): string {
   let s = label.trim().replace(/[^\p{L}\p{N}_$]+/gu, "_").replace(/^_+|_+$/g, "");
   if (!s) return "";
   if (/^[0-9]/.test(s)) s = "_" + s;
-  if (KEYWORDS.has(s) || BUILTINS[s]) s += "_";
+  if (KEYWORDS.has(s) || BUILTINS[s] || SCOPES.includes(s)) s += "_";
   return s;
 }
 export { isStr };

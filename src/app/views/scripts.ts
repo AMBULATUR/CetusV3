@@ -5,6 +5,7 @@ import { Script, Folder, ScriptStore, newScript, exportJson, importJson, uid } f
 import { comboFromEvent, normalizeCombo } from "../../shared/hotkey";
 import { loadScripts, saveScripts, runScriptOnTarget } from "../scriptstore";
 import { parseScript, BUILTIN_NAMES, rowIdentifier } from "../../page/script";
+import { SCRIPT_DOCS } from "../../shared/scriptdocs";
 
 export function scriptsView(ctx: Ctx): View {
   let store: ScriptStore = { folders: [] };
@@ -192,10 +193,38 @@ export function scriptsView(ctx: Ctx): View {
     h("p", { class: "muted" }, "Slot shortcuts run on the active tab from anywhere in the browser. The in-page hotkey field needs no setup and has no limit on how many scripts you bind, but only fires while the game tab has focus.")),
     [{ label: "Open shortcut settings", onClick: () => { void chrome.tabs.create({ url: "chrome://extensions/shortcuts" }); } }, { label: "Close", primary: true, onClick: () => {} }]);
 
+  const docs = () => modal("Scripting reference", h("pre", { class: "mono", style: { whiteSpace: "pre-wrap", maxWidth: "760px", maxHeight: "70vh", overflow: "auto", fontSize: "12px", lineHeight: "1.5" } }, SCRIPT_DOCS), [{ label: "Close", primary: true, onClick: () => {} }]);
+  /** global.x values of the page: inspect / edit / delete while the game runs */
+  const values = async () => {
+    const body = h("div", { class: "stack", style: { minWidth: "460px" } });
+    const draw = async () => {
+      let g: Record<string, unknown> = {};
+      try { g = await rpc("script.globals", {}); } catch (e) { body.replaceChildren(h("div", { class: "err" }, errMsg(e))); return; }
+      body.replaceChildren(h("div", { class: "muted" }, "Values set with global.name = … (shared by all scripts of this page until it reloads)."));
+      const names = Object.keys(g).sort();
+      if (!names.length) body.appendChild(h("div", { class: "muted" }, "no global values yet"));
+      for (const n of names) {
+        const inp = h("input", { type: "text", class: "mono", value: JSON.stringify(g[n]), style: { flex: "1" } });
+        inp.addEventListener("change", async () => {
+          try { await rpc("script.setGlobal", { name: n, value: JSON.parse(inp.value) }); } catch (e) { toast("value must be a number, \"text\", true/false or null", "error"); }
+        });
+        body.appendChild(h("div", { class: "row" }, h("b", { class: "mono", style: { width: "150px" } }, "global." + n), inp,
+          iconBtn("✕", "delete", async () => { await rpc("script.setGlobal", { name: n, delete: true }); void draw(); }, "danger")));
+      }
+      const nn = h("input", { type: "text", class: "mono", placeholder: "new name", style: { width: "150px" } });
+      const nv = h("input", { type: "text", class: "mono", placeholder: "value (123, \"text\", true)", style: { flex: "1" } });
+      body.appendChild(h("div", { class: "row" }, nn, nv, h("button", { onclick: async () => {
+        try { await rpc("script.setGlobal", { name: nn.value.trim(), value: JSON.parse(nv.value || "null") }); void draw(); } catch { toast("value must be a number, \"text\", true/false or null", "error"); }
+      } }, "Set")));
+    };
+    await draw();
+    modal("Global values", body, [{ label: "Refresh", onClick: () => { void draw(); return false; } }, { label: "Close", primary: true, onClick: () => {} }]);
+  };
+
   const el = h("div", { class: "view" },
     h("div", { class: "cols" },
       h("div", { class: "panel stack", style: { width: "300px", flex: "none", gap: "6px" } },
-        h("div", { class: "row" }, h("button", { onclick: () => void addFolder() }, "＋ Folder"), h("button", { onclick: importFile }, "Import"), h("button", { onclick: exportAll }, "Export all"), iconBtn("⌨", "about Chrome shortcut slots", shortcutsHelp)), tree),
+        h("div", { class: "row" }, h("button", { onclick: () => void addFolder() }, "＋ Folder"), h("button", { onclick: importFile }, "Import"), h("button", { onclick: exportAll }, "Export all"), iconBtn("⌨", "about Chrome shortcut slots", shortcutsHelp), h("button", { title: "scripting reference: language, rows, global/temp values, functions", onclick: docs }, "Docs"), h("button", { title: "inspect / edit the global.x values shared by all scripts on this page", onclick: () => void values() }, "Values")), tree),
       editorWrap,
       h("div", { class: "panel stack", style: { width: "210px", flex: "none" } }, rowsBox)));
 
